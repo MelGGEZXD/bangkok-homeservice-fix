@@ -1,0 +1,279 @@
+{
+  "realm": "edemand",
+  "enabled": true,
+  "displayName": "eDemand",
+  "sslRequired": "none",
+  "registrationAllowed": false,
+  "loginWithEmailAllowed": true,
+  "duplicateEmailsAllowed": false,
+  "resetPasswordAllowed": false,
+  "editUsernameAllowed": false,
+  "accessTokenLifespan": 43200,
+  "ssoSessionIdleTimeout": 43200,
+  "ssoSessionMaxLifespan": 43200,
+  "roles": {
+    "realm": [
+      { "name": "customer", "description": "Books services" },
+      { "name": "provider", "description": "Delivers services" },
+      { "name": "admin", "description": "Operates the platform" }
+    ]
+  },
+  "components": {
+    "org.keycloak.userprofile.UserProfileProvider": [
+      {
+        "id": "9d0e5a44-2f1b-4a7e-9f4c-6a1d2b3c4e5f",
+        "providerId": "declarative-user-profile",
+        "subComponents": {},
+        "config": {
+          "kc.user.profile.config": [
+            "{\"attributes\":[{\"name\":\"username\",\"displayName\":\"${username}\",\"validations\":{\"length\":{\"min\":3,\"max\":255},\"username-prohibited-characters\":{},\"up-username-not-idn-homograph\":{}},\"permissions\":{\"view\":[\"admin\",\"user\"],\"edit\":[\"admin\",\"user\"]},\"multivalued\":false},{\"name\":\"email\",\"displayName\":\"${email}\",\"validations\":{\"email\":{},\"length\":{\"max\":255}},\"required\":{\"roles\":[\"user\"]},\"permissions\":{\"view\":[\"admin\",\"user\"],\"edit\":[\"admin\",\"user\"]},\"multivalued\":false},{\"name\":\"firstName\",\"displayName\":\"${firstName}\",\"validations\":{\"length\":{\"max\":255},\"person-name-prohibited-characters\":{}},\"required\":{\"roles\":[\"user\"]},\"permissions\":{\"view\":[\"admin\",\"user\"],\"edit\":[\"admin\",\"user\"]},\"multivalued\":false},{\"name\":\"lastName\",\"displayName\":\"${lastName}\",\"validations\":{\"length\":{\"max\":255},\"person-name-prohibited-characters\":{}},\"required\":{\"roles\":[\"user\"]},\"permissions\":{\"view\":[\"admin\",\"user\"],\"edit\":[\"admin\",\"user\"]},\"multivalued\":false},{\"name\":\"local_id\",\"displayName\":\"Local monolith user id\",\"permissions\":{\"view\":[\"admin\",\"user\"],\"edit\":[\"admin\"]},\"multivalued\":false},{\"name\":\"role\",\"displayName\":\"Application role\",\"permissions\":{\"view\":[\"admin\",\"user\"],\"edit\":[\"admin\"]},\"multivalued\":false}],\"groups\":[{\"name\":\"user-metadata\",\"displayHeader\":\"User metadata\",\"displayDescription\":\"Attributes, which refer to user metadata\"}],\"unmanagedAttributePolicy\":\"ADMIN_EDIT\"}"
+          ]
+        }
+      }
+    ]
+  },
+  "clients": [
+    {
+      "clientId": "edemand-api",
+      "name": "eDemand protected APIs (audience)",
+      "description": "Resource-server audience. Tokens for the notifications service must carry it.",
+      "enabled": true,
+      "bearerOnly": true,
+      "publicClient": false,
+      "protocol": "openid-connect"
+    },
+    {
+      "clientId": "edemand-web",
+      "name": "eDemand web and mobile",
+      "description": "The only client that issues user tokens for the running system.",
+      "enabled": true,
+      "publicClient": true,
+      "directAccessGrantsEnabled": true,
+      "standardFlowEnabled": false,
+      "implicitFlowEnabled": false,
+      "serviceAccountsEnabled": false,
+      "protocol": "openid-connect",
+      "fullScopeAllowed": true,
+      "protocolMappers": [
+        {
+          "name": "local_id",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-usermodel-attribute-mapper",
+          "consentRequired": false,
+          "config": {
+            "user.attribute": "local_id",
+            "claim.name": "local_id",
+            "jsonType.label": "long",
+            "id.token.claim": "true",
+            "access.token.claim": "true",
+            "userinfo.token.claim": "true"
+          }
+        },
+        {
+          "name": "role",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-usermodel-attribute-mapper",
+          "consentRequired": false,
+          "config": {
+            "user.attribute": "role",
+            "claim.name": "role",
+            "jsonType.label": "String",
+            "id.token.claim": "true",
+            "access.token.claim": "true",
+            "userinfo.token.claim": "true"
+          }
+        },
+        {
+          "name": "edemand-api audience",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "consentRequired": false,
+          "config": {
+            "included.client.audience": "edemand-api",
+            "access.token.claim": "true",
+            "id.token.claim": "false"
+          }
+        }
+      ]
+    },
+    {
+      "clientId": "edemand-short",
+      "name": "eDemand short-lived tokens (expired-token demo only)",
+      "description": "Identical claims to edemand-web but a 5-second access-token lifespan, so the demo can show a genuine Keycloak token that expires.",
+      "enabled": true,
+      "publicClient": true,
+      "directAccessGrantsEnabled": true,
+      "standardFlowEnabled": false,
+      "implicitFlowEnabled": false,
+      "serviceAccountsEnabled": false,
+      "protocol": "openid-connect",
+      "fullScopeAllowed": true,
+      "attributes": {
+        "access.token.lifespan": "5"
+      },
+      "protocolMappers": [
+        {
+          "name": "local_id",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-usermodel-attribute-mapper",
+          "consentRequired": false,
+          "config": {
+            "user.attribute": "local_id",
+            "claim.name": "local_id",
+            "jsonType.label": "long",
+            "id.token.claim": "true",
+            "access.token.claim": "true",
+            "userinfo.token.claim": "true"
+          }
+        },
+        {
+          "name": "role",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-usermodel-attribute-mapper",
+          "consentRequired": false,
+          "config": {
+            "user.attribute": "role",
+            "claim.name": "role",
+            "jsonType.label": "String",
+            "id.token.claim": "true",
+            "access.token.claim": "true",
+            "userinfo.token.claim": "true"
+          }
+        },
+        {
+          "name": "edemand-api audience",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "consentRequired": false,
+          "config": {
+            "included.client.audience": "edemand-api",
+            "access.token.claim": "true",
+            "id.token.claim": "false"
+          }
+        }
+      ]
+    },
+    {
+      "clientId": "edemand-other",
+      "name": "eDemand wrong-audience tokens (demo only)",
+      "description": "Valid Keycloak client, but its tokens do not carry the edemand-api audience.",
+      "enabled": true,
+      "publicClient": true,
+      "directAccessGrantsEnabled": true,
+      "standardFlowEnabled": false,
+      "implicitFlowEnabled": false,
+      "serviceAccountsEnabled": false,
+      "protocol": "openid-connect",
+      "fullScopeAllowed": true,
+      "protocolMappers": [
+        {
+          "name": "local_id",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-usermodel-attribute-mapper",
+          "consentRequired": false,
+          "config": {
+            "user.attribute": "local_id",
+            "claim.name": "local_id",
+            "jsonType.label": "long",
+            "id.token.claim": "true",
+            "access.token.claim": "true",
+            "userinfo.token.claim": "true"
+          }
+        },
+        {
+          "name": "role",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-usermodel-attribute-mapper",
+          "consentRequired": false,
+          "config": {
+            "user.attribute": "role",
+            "claim.name": "role",
+            "jsonType.label": "String",
+            "id.token.claim": "true",
+            "access.token.claim": "true",
+            "userinfo.token.claim": "true"
+          }
+        }
+      ]
+    }
+  ],
+  "users": [
+    {
+      "username": "admin@edemand.test",
+      "email": "admin@edemand.test",
+      "emailVerified": true,
+      "enabled": true,
+      "firstName": "Ops",
+      "lastName": "Admin",
+      "attributes": { "local_id": ["1"], "role": ["admin"] },
+      "realmRoles": ["admin"],
+      "credentials": [{ "type": "password", "value": "eDemand-2026!", "temporary": false }]
+    },
+    {
+      "username": "nong@example.com",
+      "email": "nong@example.com",
+      "emailVerified": true,
+      "enabled": true,
+      "firstName": "Nong",
+      "lastName": "Napat",
+      "attributes": { "local_id": ["1"], "role": ["customer"] },
+      "realmRoles": ["customer"],
+      "credentials": [{ "type": "password", "value": "eDemand-2026!", "temporary": false }]
+    },
+    {
+      "username": "somchai@example.com",
+      "email": "somchai@example.com",
+      "emailVerified": true,
+      "enabled": true,
+      "firstName": "Somchai",
+      "lastName": "Boon",
+      "attributes": { "local_id": ["2"], "role": ["customer"] },
+      "realmRoles": ["customer"],
+      "credentials": [{ "type": "password", "value": "eDemand-2026!", "temporary": false }]
+    },
+    {
+      "username": "aom@example.com",
+      "email": "aom@example.com",
+      "emailVerified": true,
+      "enabled": true,
+      "firstName": "Aom",
+      "lastName": "Piyada",
+      "attributes": { "local_id": ["3"], "role": ["customer"] },
+      "realmRoles": ["customer"],
+      "credentials": [{ "type": "password", "value": "eDemand-2026!", "temporary": false }]
+    },
+    {
+      "username": "sparkle@example.com",
+      "email": "sparkle@example.com",
+      "emailVerified": true,
+      "enabled": true,
+      "firstName": "Sparkle",
+      "lastName": "Cleaners",
+      "attributes": { "local_id": ["1"], "role": ["provider"] },
+      "realmRoles": ["provider"],
+      "credentials": [{ "type": "password", "value": "eDemand-2026!", "temporary": false }]
+    },
+    {
+      "username": "fixit@example.com",
+      "email": "fixit@example.com",
+      "emailVerified": true,
+      "enabled": true,
+      "firstName": "FixIt",
+      "lastName": "Bros",
+      "attributes": { "local_id": ["2"], "role": ["provider"] },
+      "realmRoles": ["provider"],
+      "credentials": [{ "type": "password", "value": "eDemand-2026!", "temporary": false }]
+    },
+    {
+      "username": "glow@example.com",
+      "email": "glow@example.com",
+      "emailVerified": true,
+      "enabled": true,
+      "firstName": "Glow",
+      "lastName": "Beauty",
+      "attributes": { "local_id": ["3"], "role": ["provider"] },
+      "realmRoles": ["provider"],
+      "credentials": [{ "type": "password", "value": "eDemand-2026!", "temporary": false }]
+    }
+  ]
+}

@@ -1,0 +1,340 @@
+openapi: 3.0.3
+info:
+  title: eDemand API
+  version: 1.0.0
+  description: >
+    On-demand home-services marketplace (DES428 case study). One Next.js monolith: UI pages +
+    App Router route handlers + one SQLite file. Eight bounded contexts. Every write that changes
+    state also writes a domain event to the outbox in the same transaction; a relay drains it.
+    Auth is a Keycloak-issued RS256 access token (realm `edemand`, audience `edemand-api`). Both the
+    monolith and the extracted notifications service verify signature, issuer, audience and expiry
+    themselves against the realm JWKS; a forged, expired or wrong-audience token gets 401 at either
+    boundary. Login endpoints accept email+password and return a Keycloak token. Send
+    `Authorization: Bearer <jwt>`; the browser UI also carries an httpOnly `edemand_token` cookie
+    that verifies the same token. Money is integer
+    cents. Errors share the shape `{error, requestId, details?}`; every response echoes `X-Request-Id`.
+    Area A: `http://localhost:3000` is the nginx gateway. `/api/notifications*` is served by the
+    extracted Express notifications service (its own PostgreSQL DB); every other path is still the
+    Next.js monolith. The public paths below are unchanged by the extraction.
+servers:
+  - url: http://localhost:3000
+tags:
+  - name: Identity
+  - name: Catalog
+  - name: Provider Profile
+  - name: Booking
+  - name: Bidding
+  - name: Payments & Wallet
+  - name: Reviews
+  - name: Notifications
+  - name: Admin
+  - name: Ops
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: Keycloak access token (RS256). Verified locally against http://localhost:8081/realms/edemand JWKS; must carry audience `edemand-api`.
+    webhookSecret: { type: apiKey, in: header, name: X-Webhook-Secret }
+  schemas:
+    Error:
+      type: object
+      properties:
+        error: { type: string }
+        requestId: { type: string }
+        details:
+          type: array
+          items:
+            type: object
+            properties:
+              path: { type: string }
+              message: { type: string }
+    Order:
+      type: object
+      properties:
+        id: { type: integer, example: 8001 }
+        customer_id: { type: integer }
+        provider_id: { type: integer }
+        service_date: { type: string, example: "2026-08-03" }
+        starting_time: { type: string, example: "10:00" }
+        ending_time: { type: string, example: "11:30" }
+        subtotal_cents: { type: integer }
+        tax_cents: { type: integer }
+        total_cents: { type: integer }
+        commission_pct: { type: number }
+        commission_cents: { type: integer, nullable: true }
+        provider_earnings_cents: { type: integer, nullable: true }
+        payment_method: { type: string, enum: [cod, gateway] }
+        payment_status: { type: string, enum: [pending, paid, refunded] }
+        status: { type: string, enum: [awaiting, confirmed, started, completed, cancelled, rescheduled] }
+    PlaceBookingResult:
+      type: object
+      properties:
+        order: { $ref: '#/components/schemas/Order' }
+        otp: { type: integer, example: 428193 }
+        payment_intent:
+          type: object
+          nullable: true
+          properties:
+            id: { type: integer }
+            gateway_ref: { type: string, example: "SIM-PI-..." }
+            status: { type: string, enum: [requires_payment, succeeded, failed] }
+    Service:
+      type: object
+      properties:
+        id: { type: integer }
+        provider_id: { type: integer }
+        category_id: { type: integer }
+        title: { type: string }
+        price_cents: { type: integer }
+        duration_min: { type: integer }
+        rating_avg: { type: number }
+        rating_count: { type: integer }
+security:
+  - bearerAuth: []
+paths:
+  /api/health:
+    get: { tags: [Ops], security: [], summary: Liveness, responses: { '200': { description: ok } } }
+  /api/ready:
+    get: { tags: [Ops], security: [], summary: Readiness (SELECT 1), responses: { '200': { description: ok }, '503': { description: db unavailable } } }
+
+  /api/auth/customer/register:
+    post:
+      tags: [Identity]
+      security: []
+      summary: Register a customer
+      requestBody:
+        required: true
+        content: { application/json: { schema: { type: object, required: [email, password, name], properties: { email: {type: string}, password: {type: string, minLength: 8}, name: {type: string}, phone: {type: string} } } } }
+      responses: { '201': { description: created }, '409': { description: email taken, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } } }
+  /api/auth/customer/login:
+    post:
+      tags: [Identity]
+      security: []
+      summary: Log in a customer (returns token + sets edemand_token cookie)
+      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [email, password], properties: { email: {type: string}, password: {type: string} } } } } }
+      responses: { '200': { description: ok }, '401': { description: bad creds } }
+  /api/auth/provider/register:
+    post: { tags: [Identity], security: [], summary: Register a provider (also creates profile + wallet), responses: { '201': { description: created } } }
+  /api/auth/provider/login:
+    post: { tags: [Identity], security: [], summary: Log in a provider (returns token + is_approved), responses: { '200': { description: ok } } }
+  /api/auth/admin/login:
+    post: { tags: [Identity], security: [], summary: Log in an admin, responses: { '200': { description: ok } } }
+  /api/auth/logout:
+    post: { tags: [Identity], summary: Clear the session cookie, responses: { '200': { description: ok } } }
+  /api/me:
+    get: { tags: [Identity], summary: Role-appropriate profile, responses: { '200': { description: ok }, '401': { description: no token } } }
+
+  /api/categories:
+    get: { tags: [Catalog], security: [], summary: Active categories, responses: { '200': { description: ok } } }
+  /api/categories/{slug}/services:
+    get:
+      tags: [Catalog]
+      security: []
+      summary: Active services in a category (approved providers only)
+      parameters: [ { name: slug, in: path, required: true, schema: { type: string } } ]
+      responses: { '200': { description: ok }, '404': { description: unknown category } }
+  /api/services:
+    get:
+      tags: [Catalog]
+      security: []
+      summary: Search services
+      parameters:
+        - { name: category_id, in: query, schema: { type: integer } }
+        - { name: provider_id, in: query, schema: { type: integer } }
+        - { name: q, in: query, schema: { type: string } }
+        - { name: page, in: query, schema: { type: integer, default: 1 } }
+        - { name: size, in: query, schema: { type: integer, default: 20 } }
+      responses: { '200': { description: 'ok (headers: X-Total-Count, X-Page)' } }
+  /api/services/{id}:
+    get:
+      tags: [Catalog]
+      security: []
+      parameters: [ { name: id, in: path, required: true, schema: { type: integer } } ]
+      responses: { '200': { description: ok }, '404': { description: missing } }
+  /api/services/{id}/reviews:
+    get:
+      tags: [Reviews]
+      security: []
+      parameters: [ { name: id, in: path, required: true, schema: { type: integer } } ]
+      responses: { '200': { description: reviews + aggregate } }
+  /api/provider/services:
+    get: { tags: [Catalog], summary: 'Own services (P)', responses: { '200': { description: ok } } }
+    post:
+      tags: [Catalog]
+      summary: 'Create a service (P). duration_min must be a positive multiple of 30.'
+      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [category_id, title, price_cents, duration_min], properties: { category_id: {type: integer}, title: {type: string}, description: {type: string}, price_cents: {type: integer}, duration_min: {type: integer}, tax_percent: {type: number} } } } } }
+      responses: { '201': { description: created }, '400': { description: validation } }
+  /api/provider/services/{id}:
+    patch:
+      tags: [Catalog]
+      summary: 'Update own service (P); 403 for others'
+      parameters: [ { name: id, in: path, required: true, schema: { type: integer } } ]
+      responses: { '200': { description: ok }, '403': { description: not owner } }
+
+  /api/providers:
+    get: { tags: [Provider Profile], security: [], summary: Approved providers, responses: { '200': { description: ok } } }
+  /api/providers/{id}:
+    get:
+      tags: [Provider Profile]
+      security: []
+      parameters: [ { name: id, in: path, required: true, schema: { type: integer } } ]
+      responses: { '200': { description: profile + services + timings }, '404': { description: missing/unapproved } }
+  /api/providers/{id}/slots:
+    get:
+      tags: [Booking]
+      security: []
+      summary: Available 30-min start times (advisory read)
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: integer } }
+        - { name: date, in: query, required: true, schema: { type: string, example: "2026-08-03" } }
+        - { name: duration, in: query, required: true, schema: { type: integer } }
+      responses: { '200': { description: '{date, slots[]}' } }
+  /api/provider/profile:
+    get: { tags: [Provider Profile], summary: 'Own profile incl. commission (P)', responses: { '200': { description: ok } } }
+    patch: { tags: [Provider Profile], summary: 'Update own profile (P). Cannot set is_approved / commission_pct.', responses: { '200': { description: ok } } }
+  /api/provider/timings:
+    get: { tags: [Provider Profile], summary: 'Own 7-day availability (P)', responses: { '200': { description: ok } } }
+    put: { tags: [Provider Profile], summary: 'Upsert availability (P); closing>opening', responses: { '200': { description: ok }, '400': { description: validation } } }
+  /api/admin/providers/{id}/approve:
+    post:
+      tags: [Admin]
+      summary: 'Approve a provider (A) -> notifies the provider'
+      parameters: [ { name: id, in: path, required: true, schema: { type: integer } } ]
+      responses: { '200': { description: ok }, '403': { description: not admin } }
+  /api/admin/providers/{id}/commission:
+    patch:
+      tags: [Admin]
+      summary: 'Set commission_pct 0..100 (A)'
+      parameters: [ { name: id, in: path, required: true, schema: { type: integer } } ]
+      responses: { '200': { description: ok } }
+  /api/admin/bookings:
+    get: { tags: [Admin], summary: 'All bookings (A), paginated', responses: { '200': { description: ok } } }
+
+  /api/bookings:
+    post:
+      tags: [Booking]
+      summary: 'Place a booking (C) — THE place-booking transaction. Honors Idempotency-Key.'
+      parameters: [ { name: Idempotency-Key, in: header, schema: { type: string } } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [provider_id, service_date, starting_time, items, payment_method]
+              properties:
+                provider_id: { type: integer }
+                address_id: { type: integer }
+                service_date: { type: string, example: "2026-08-03" }
+                starting_time: { type: string, example: "10:00" }
+                items: { type: array, items: { type: object, properties: { service_id: {type: integer}, quantity: {type: integer} } } }
+                payment_method: { type: string, enum: [cod, gateway] }
+      responses:
+        '201': { description: created, content: { application/json: { schema: { $ref: '#/components/schemas/PlaceBookingResult' } } } }
+        '409': { description: 'slot no longer available', content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+    get:
+      tags: [Booking]
+      summary: 'My bookings (C or P), paginated, ?status'
+      parameters: [ { name: status, in: query, schema: { type: string } }, { name: page, in: query, schema: { type: integer } }, { name: size, in: query, schema: { type: integer } } ]
+      responses: { '200': { description: ok } }
+  /api/bookings/{id}:
+    get:
+      tags: [Booking]
+      summary: 'One booking (participant-only; OTP shown to the customer only)'
+      parameters: [ { name: id, in: path, required: true, schema: { type: integer } } ]
+      responses: { '200': { description: ok }, '403': { description: not a participant }, '404': { description: missing } }
+  /api/bookings/{id}/confirm:
+    post: { tags: [Booking], summary: 'awaiting -> confirmed (P)', parameters: [ { name: id, in: path, required: true, schema: { type: integer } } ], responses: { '200': { description: ok }, '409': { description: illegal state } } }
+  /api/bookings/{id}/start:
+    post: { tags: [Booking], summary: 'confirmed|rescheduled -> started (P)', parameters: [ { name: id, in: path, required: true, schema: { type: integer } } ], responses: { '200': { description: ok }, '403': { description: not provider }, '409': { description: illegal state } } }
+  /api/bookings/{id}/complete:
+    post:
+      tags: [Booking]
+      summary: 'OTP-gated completion (P): started -> completed, wallet credit, outbox event'
+      parameters: [ { name: id, in: path, required: true, schema: { type: integer } } ]
+      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [otp], properties: { otp: { type: integer } } } } } }
+      responses: { '200': { description: completed }, '400': { description: OTP is required }, '409': { description: 'incorrect OTP / illegal state' } }
+  /api/bookings/{id}/cancel:
+    post: { tags: [Booking], summary: 'awaiting|confirmed -> cancelled (C); releases slots, refunds if paid', parameters: [ { name: id, in: path, required: true, schema: { type: integer } } ], responses: { '200': { description: ok }, '409': { description: illegal state } } }
+  /api/bookings/{id}/reschedule:
+    post:
+      tags: [Booking]
+      summary: 'Re-hold slots atomically (C or P) -> status rescheduled'
+      parameters: [ { name: id, in: path, required: true, schema: { type: integer } } ]
+      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [service_date, starting_time], properties: { service_date: {type: string}, starting_time: {type: string} } } } } }
+      responses: { '200': { description: ok }, '409': { description: 'new slot taken (old holds intact)' } }
+  /api/bookings/{id}/review:
+    post:
+      tags: [Reviews]
+      summary: 'Review a completed booking once (C). Writes review + review.created event; aggregate recompute is in the relay.'
+      parameters: [ { name: id, in: path, required: true, schema: { type: integer } } ]
+      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [rating], properties: { rating: {type: integer, minimum: 1, maximum: 5}, comment: {type: string} } } } } }
+      responses: { '201': { description: created }, '409': { description: 'duplicate / not completed' } }
+
+  /api/jobs:
+    post: { tags: [Bidding], summary: 'Post a custom job (C)', responses: { '201': { description: created } } }
+    get: { tags: [Bidding], summary: 'Open jobs (P) or own jobs (C)', responses: { '200': { description: ok } } }
+  /api/jobs/{id}:
+    get:
+      tags: [Bidding]
+      summary: 'Job + bids (owner sees all; provider sees own bid + count)'
+      parameters: [ { name: id, in: path, required: true, schema: { type: integer } } ]
+      responses: { '200': { description: ok }, '404': { description: missing } }
+  /api/jobs/{id}/cancel:
+    post: { tags: [Bidding], summary: 'open -> cancelled (C, owner)', parameters: [ { name: id, in: path, required: true, schema: { type: integer } } ], responses: { '200': { description: ok } } }
+  /api/jobs/{id}/bids:
+    post:
+      tags: [Bidding]
+      summary: 'Place a bid (P, approved + accepting)'
+      parameters: [ { name: id, in: path, required: true, schema: { type: integer } } ]
+      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [counter_price_cents, duration_min], properties: { counter_price_cents: {type: integer}, note: {type: string}, duration_min: {type: integer} } } } } }
+      responses: { '201': { description: created }, '409': { description: 'job not open / already bid' } }
+  /api/jobs/{id}/bids/{bidId}/accept:
+    post:
+      tags: [Bidding]
+      summary: 'THE bid-accept transaction (C): exactly one bid wins, creates a booking'
+      parameters: [ { name: id, in: path, required: true, schema: { type: integer } }, { name: bidId, in: path, required: true, schema: { type: integer } } ]
+      responses: { '200': { description: '{order, otp}' }, '409': { description: 'job already booked / bid not pending' } }
+  /api/jobs/{id}/bids/{bidId}/withdraw:
+    post:
+      tags: [Bidding]
+      summary: 'Withdraw own pending bid (P), conditional'
+      parameters: [ { name: id, in: path, required: true, schema: { type: integer } }, { name: bidId, in: path, required: true, schema: { type: integer } } ]
+      responses: { '200': { description: ok }, '409': { description: no longer withdrawable } }
+
+  /api/payments/webhook:
+    post:
+      tags: [Payments & Wallet]
+      security: [ { webhookSecret: [] } ]
+      summary: 'Idempotent gateway webhook. Replays (same gateway_event_id) are 200 no-ops.'
+      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [gateway_event_id, type, gateway_ref], properties: { gateway_event_id: {type: string}, type: {type: string}, gateway_ref: {type: string} } } } } }
+      responses: { '200': { description: 'received (or replayed no-op)' }, '401': { description: bad secret } }
+  /api/payments/simulate:
+    post:
+      tags: [Payments & Wallet]
+      summary: 'Mock gateway "Pay now" (C): drives the same idempotent webhook path'
+      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [order_id], properties: { order_id: { type: integer } } } } } }
+      responses: { '200': { description: ok } }
+  /api/provider/wallet:
+    get: { tags: [Payments & Wallet], summary: 'Balance + commission owed + transactions (P)', responses: { '200': { description: ok } } }
+  /api/customer/transactions:
+    get: { tags: [Payments & Wallet], summary: 'Own charges/refunds (C)', responses: { '200': { description: ok } } }
+  /api/customer/addresses:
+    get: { tags: [Booking], summary: 'Own addresses (C)', responses: { '200': { description: ok } } }
+    post: { tags: [Booking], summary: 'Add an address (C)', responses: { '201': { description: created } } }
+
+  /api/notifications:
+    get:
+      tags: [Notifications]
+      summary: 'My notifications, newest first'
+      description: Served by the extracted notifications service (gateway-routed).
+      responses: { '200': { description: ok } }
+  /api/notifications/{id}/read:
+    post:
+      tags: [Notifications]
+      summary: 'Mark one read (own only)'
+      description: Served by the extracted notifications service, which enforces record ownership.
+      parameters: [ { name: id, in: path, required: true, schema: { type: integer } } ]
+      responses: { '200': { description: ok }, '403': { description: not yours } }

@@ -1,0 +1,15 @@
+**/node_modules
+.next
+**/.next
+npm-debug.log
+.git
+.gitignore
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+data
+Dockerfile
+docker-compose.yml
+.dockerignore
+README.md
