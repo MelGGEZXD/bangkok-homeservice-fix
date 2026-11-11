@@ -49,6 +49,19 @@ function requireInternalKey(req, res, next) {
   return next();
 }
 
+async function insertNotification(pool, n) {
+  const { rows } = await pool.query(
+    `INSERT INTO notifications
+       (source_event_id, recipient_role, recipient_id, type, title, body, order_id)
+     VALUES ($1, $2, $3, $4, $5, $6, $7)
+     ON CONFLICT (source_event_id, recipient_role, recipient_id, type) DO NOTHING
+     RETURNING *`,
+    [n.source_event_id, n.recipient_role, n.recipient_id, n.type, n.title, n.body, n.order_id ?? null]
+  );
+
+  return rows[0] ?? null;
+}
+
 function createApp(pool) {
   const app = express();
   app.disable("x-powered-by");
@@ -111,21 +124,12 @@ function createApp(pool) {
     if (!parsed.success) {
       return res.status(400).json({ error: "invalid notification command", details: parsed.error.flatten() });
     }
-    const n = parsed.data;
 
-    const { rows } = await pool.query(
-      `INSERT INTO notifications
-         (source_event_id, recipient_role, recipient_id, type, title, body, order_id)
-       VALUES ($1, $2, $3, $4, $5, $6, $7)
-       ON CONFLICT (source_event_id, recipient_role, recipient_id, type) DO NOTHING
-       RETURNING *`,
-      [n.source_event_id, n.recipient_role, n.recipient_id, n.type, n.title, n.body, n.order_id ?? null]
-    );
-
-    if (rows.length === 0) {
+    const row = await insertNotification(pool, parsed.data);
+    if (!row) {
       return res.status(200).json({ duplicate: true });
     }
-    return res.status(201).json({ duplicate: false, notification: toPublic(rows[0]) });
+    return res.status(201).json({ duplicate: false, notification: toPublic(row) });
   });
 
   app.use((req, res) => {
@@ -144,4 +148,4 @@ function createApp(pool) {
   return app;
 }
 
-module.exports = { createApp };
+module.exports = { createApp, insertNotification, notificationCommand };

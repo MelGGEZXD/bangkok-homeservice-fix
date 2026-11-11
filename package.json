@@ -17,8 +17,9 @@
     "test": "node --test"
   },
   "dependencies": {
-    "better-sqlite3": "11.10.0",
+    "amqplib": "^2.3.1",
     "bcryptjs": "2.4.3",
+    "better-sqlite3": "11.10.0",
     "jsonwebtoken": "9.0.2",
     "next": "14.2.35",
     "pino": "9.4.0",
