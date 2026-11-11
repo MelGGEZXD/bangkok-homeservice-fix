@@ -13,6 +13,11 @@ repair, beauty, appliance) instead of ride-hailing.
 Students run this as a monolith, feel where it strains, and use it as the system they migrate
 toward microservices. The bounded-context boundaries below **are** the future service seams.
 
+**Capstone deliverables:** [`docs/dossier.md`](docs/dossier.md) (architecture dossier and industrial
+landscape), [`OWNERS.md`](OWNERS.md) (area ownership and commits), and the four demo scripts under
+`scripts/` with their expected output in [Demo scripts — the four beats](#demo-scripts--the-four-beats).
+Submission tag: `capstone-final`.
+
 ---
 
 ## What it is
