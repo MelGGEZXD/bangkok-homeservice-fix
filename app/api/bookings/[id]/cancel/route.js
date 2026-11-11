@@ -9,5 +9,5 @@ import * as booking from "#lib/modules/booking/service.js";
 
 export const POST = handle(async (req, { params }) => {
   const auth = getAuth(req, "customer");
-  return json(booking.cancelBooking(parseId(params.id, "booking id"), auth.sub));
+  return json(await booking.cancelBooking(parseId(params.id, "booking id"), auth.sub));
 });

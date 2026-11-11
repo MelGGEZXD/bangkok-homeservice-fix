@@ -14,5 +14,5 @@ const schema = z.object({ otp: z.coerce.number().int() });
 export const POST = handle(async (req, { params }) => {
   const auth = getAuth(req, "provider");
   const { otp } = parse(schema, await readJson(req));
-  return json(booking.completeBooking(parseId(params.id, "booking id"), auth.sub, otp));
+  return json(await booking.completeBooking(parseId(params.id, "booking id"), auth.sub, otp));
 });

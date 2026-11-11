@@ -10,8 +10,13 @@ process.env.DB_PATH = ":memory:";
 
 const { bootstrapDb } = await import("../lib/db/bootstrap.js");
 const { getDb, closeDb } = await import("../lib/db/index.js");
+// Area A: the payments service is a real process in production. In tests the injected transport
+// implements the same contract in memory (see test-helpers/payments.js).
+const { installPaymentsFake, resetPaymentsFake } = await import("./payments.js");
+installPaymentsFake();
 
 export function freshBoot() {
+  resetPaymentsFake();
   return bootstrapDb();
 }
 

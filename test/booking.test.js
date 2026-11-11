@@ -6,6 +6,7 @@ import assert from "node:assert/strict";
 import { freshBoot, getDb } from "../test-helpers/boot.js";
 import { call } from "../test-helpers/call.js";
 import { loginSeededCustomer, loginSeededProvider, futureWeekday } from "../test-helpers/auth.js";
+import { fakeWallet } from "../test-helpers/payments.js";
 
 import * as bookings from "../app/api/bookings/route.js";
 import * as bookingDetail from "../app/api/bookings/[id]/route.js";
@@ -144,12 +145,13 @@ test("booking lifecycle", async (t) => {
     assert.ok(event, "expected a booking.completed outbox event");
 
     // COD: commission is owed by the provider. total = 64200, commission = round(64200*0.15) = 9630.
-    const owedAfter = getDb().prepare("SELECT commission_owed_cents AS c FROM provider_wallets WHERE provider_id = ?").get(provider.id).c;
+    // The wallet lives in the payments service; the fake records the crossed command.
+    const owedAfter = fakeWallet(provider.id).commission_owed_cents;
     assert.equal(owedAfter, 9630);
 
     const second = await call(complete.POST, { token: provider.token, params: { id: "8001" }, body: { otp: firstOtp } });
     assert.equal(second.status, 409, "a second complete is rejected");
-    const owedStill = getDb().prepare("SELECT commission_owed_cents AS c FROM provider_wallets WHERE provider_id = ?").get(provider.id).c;
+    const owedStill = fakeWallet(provider.id).commission_owed_cents;
     assert.equal(owedStill, 9630, "wallet unchanged — credited exactly once");
   });
 

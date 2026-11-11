@@ -1,14 +1,21 @@
 export const dynamic = "force-dynamic";
 
 import { redirect } from "next/navigation";
-import { getSession } from "#lib/http/session.js";
-import * as payments from "#lib/modules/payments/service.js";
+import { getSession, getSessionToken } from "#lib/http/session.js";
+import * as payments from "#lib/modules/payments/client.js";
 import { money } from "../../../_ui/format.js";
 
-export default function WalletPage() {
+export default async function WalletPage() {
   const session = getSession();
   if (!session || session.role !== "provider") redirect("/provider/login");
-  const wallet = payments.getWallet(session.sub);
+
+  let wallet = { balance_cents: 0, commission_owed_cents: 0, transactions: [] };
+  try {
+    wallet = await payments.getWallet(getSessionToken());
+  } catch {
+    // The payment service is briefly unavailable: render the dashboard shell at zero rather than
+    // failing the whole page. The counts are not cached anywhere in the monolith.
+  }
 
   return (
     <div>

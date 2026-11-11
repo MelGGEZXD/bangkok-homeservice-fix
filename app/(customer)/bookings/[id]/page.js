@@ -6,13 +6,13 @@ import * as booking from "#lib/modules/booking/service.js";
 import { money, Badge } from "../../../_ui/format.js";
 import { ActionButton, ReviewForm } from "../../../_ui/client.js";
 
-export default function BookingDetailPage({ params }) {
+export default async function BookingDetailPage({ params }) {
   const session = getSession();
   if (!session) redirect("/login");
 
   let b;
   try {
-    b = booking.getBooking(Number(params.id), { sub: session.sub, role: session.role });
+    b = await booking.getBooking(Number(params.id), { sub: session.sub, role: session.role });
   } catch (e) {
     if (e.statusCode === 404) notFound();
     redirect("/");

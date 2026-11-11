@@ -1,5 +1,6 @@
-# Area A: the only published entry point. nginx routes /api/notifications to the extracted service
-# and everything else to the monolith, so public URLs do not change when a context moves.
+# Area A: the only published entry point. nginx routes each extracted context (notifications,
+# payments) to its own service with its own database, and everything else to the monolith, so public
+# URLs do not change when a context moves.
 name: edemand
 
 services:
@@ -13,6 +14,8 @@ services:
       edemand:
         condition: service_healthy
       notifications:
+        condition: service_healthy
+      payments:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://127.0.0.1/api/health"]
@@ -51,6 +54,10 @@ services:
       INTERNAL_API_KEY: ${INTERNAL_API_KEY:-dev-internal-key-change-me}
       NOTIFICATIONS_SERVICE_URL: http://notifications:3001
       NOTIFICATIONS_TIMEOUT_MS: "3000"
+      # Area A, second extraction: wallet/ledger calls cross this seam.
+      PAYMENTS_SERVICE_URL: http://payments:3002
+      PAYMENTS_TIMEOUT_MS: "3000"
+      WEBHOOK_SECRET: ${WEBHOOK_SECRET:-edemand-webhook-secret}
       # Area C: the only path for domain events across the boundary.
       RABBITMQ_URL: amqp://${RABBITMQ_USER:-edemand}:${RABBITMQ_PASSWORD:-edemand-demo-pass}@rabbitmq:5672
       RABBITMQ_EXCHANGE: edemand.events
@@ -143,6 +150,58 @@ services:
       start_period: 60s
       retries: 6
 
+  # ---- Area A, second extraction: Payments & Wallet -------------------------------------------
+  payments-db:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-password}
+      POSTGRES_DB: ${PAYMENTS_DB:-payments_db}
+    # Not published: only the payments service needs it.
+    expose:
+      - "5432"
+    volumes:
+      - payments-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-user} -d ${PAYMENTS_DB:-payments_db}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  payments:
+    build:
+      context: ./payments-service
+    expose:
+      - "3002"
+    environment:
+      PORT: "3002"
+      DATABASE_URL: postgres://${POSTGRES_USER:-user}:${POSTGRES_PASSWORD:-password}@payments-db:5432/${PAYMENTS_DB:-payments_db}
+      # Area B: verifies Keycloak-issued RS256 tokens itself via the realm JWKS.
+      KEYCLOAK_URL: http://keycloak:8080
+      KEYCLOAK_REALM: edemand
+      KEYCLOAK_ISSUER: http://localhost:8081/realms/edemand
+      KEYCLOAK_AUDIENCE: edemand-api
+      INTERNAL_API_KEY: ${INTERNAL_API_KEY:-dev-internal-key-change-me}
+      WEBHOOK_SECRET: ${WEBHOOK_SECRET:-edemand-webhook-secret}
+      # After money commits, tell the order owner (the monolith) over an internal idempotent call.
+      BOOKING_SERVICE_URL: http://edemand:3000
+      BOOKING_TIMEOUT_MS: "3000"
+    depends_on:
+      payments-db:
+        condition: service_healthy
+      keycloak:
+        condition: service_started
+      # Needs the order-side internal endpoint, so start after the monolith is healthy.
+      edemand:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('http').get('http://127.0.0.1:3002/health',r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1))"]
+      interval: 10s
+      timeout: 3s
+      # The service also waits for the realm JWKS before it starts listening.
+      start_period: 60s
+      retries: 6
+
   # Area C broker. The management console is published for the demo (beat4 / trace inspection);
   # 5672 is exposed on the host so an operator can point `amqp` tooling at the stack.
   rabbitmq:
@@ -164,4 +223,5 @@ services:
 
 volumes:
   notifications-db-data:
+  payments-db-data:
   rabbitmq-data:

@@ -7,6 +7,11 @@
 #   4. the notifications service enforces record ownership (403 for another user)
 #   5. the monolith SQLite file has no notifications table
 #   6. a replayed internal delivery returns duplicate:true (exactly-one effect)
+#   7. the gateway routes wallet/ledger reads to the SECOND extracted service (payments)
+#   8. the payments service verifies the Keycloak token itself and enforces role ownership
+#   9. the monolith SQLite file has none of the four moved money tables
+#  10. a gateway webhook settles a booking once; a replay is a 200 no-op (one charge row)
+#  11. provider registration writes a wallet into the payments database, not the monolith
 #
 # It resets the compose volumes first, so the run is deterministic.
 # Usage:  powershell -ExecutionPolicy Bypass -File .\scripts\verify-area-a.ps1
@@ -147,6 +152,87 @@ $result = $probeOut | ConvertFrom-Json
 Check ($result.first.body.duplicate -eq $false) "first internal delivery creates the notification"
 Check ($result.second.body.duplicate -eq $true) "replayed internal delivery is recognised as duplicate"
 Check ([int]$result.count -eq 1) "database contains exactly one row for the probe"
+
+Write-Host "== checking the second extracted service: Payments & Wallet ==" -ForegroundColor Cyan
+$wallet401 = (Invoke-Quietly { & curl.exe -s "$base/api/provider/wallet" }) -join ""
+Check ((Status @("-s", "-o", "NUL", "-w", "%{http_code}", "$base/api/provider/wallet")) -eq "401") "unauthenticated wallet read is 401"
+Check ($wallet401 -match "missing bearer token") "401 body came from the payments service"
+Check ($wallet401 -notmatch "requestId") "wallet response is not the monolith error shape"
+
+$sparkle = Login "/api/auth/provider/login" "sparkle@example.com"
+$wallet = Invoke-RestMethod -Uri "$base/api/provider/wallet" -Headers @{ Authorization = "Bearer $sparkle" }
+Check ($wallet.provider_id -eq 1) "Sparkle reads her own wallet through the gateway"
+Check ($wallet.balance_cents -ge 0) "wallet carries a balance field from the payments service"
+
+$nong = Login "/api/auth/customer/login" "nong@example.com"
+$crossRole = Status @("-s", "-o", "NUL", "-w", "%{http_code}", "$base/api/provider/wallet", "-H", "Authorization: Bearer $nong")
+Check ($crossRole -eq "403") "a customer token cannot read the provider wallet (403 from the payments service)"
+
+$moneyDbCheck = @'
+const Database = require("better-sqlite3");
+const db = new Database("/app/data/edemand.db", { readonly: true });
+const names = ["payment_intents", "transactions", "provider_wallets", "webhook_events"];
+const rows = db.prepare(
+  "SELECT name FROM sqlite_master WHERE type='table' AND name IN (" + names.map(() => "?").join(",") + ")"
+).all(...names);
+console.log(JSON.stringify(rows));
+'@
+$b64Money = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($moneyDbCheck))
+$moneyOut = (Invoke-Quietly { & docker compose exec -T edemand node -e "eval(Buffer.from('$b64Money','base64').toString())" }) -join ""
+Check ($moneyOut.Trim() -eq "[]") "monolith SQLite has none of the four payments tables"
+
+Write-Host "== settling a gateway booking across the boundary ==" -ForegroundColor Cyan
+$when = (Get-Date).AddDays(3)
+if ($when.DayOfWeek -eq "Sunday") { $when = $when.AddDays(1) }
+$date = $when.ToString("yyyy-MM-dd")
+$bookingBody = @{
+  provider_id = 1; address_id = 1; service_date = $date; starting_time = "09:00";
+  items = @(@{ service_id = 2; quantity = 1 }); payment_method = "gateway"
+} | ConvertTo-Json -Depth 5 -Compress
+$placed = Invoke-RestMethod -Method Post -Uri "$base/api/bookings" -ContentType "application/json" -Headers @{ Authorization = "Bearer $nong" } -Body $bookingBody
+Check ($placed.payment_intent.status -eq "requires_payment") "booking created a requires_payment intent in the payments service"
+Check ($placed.payment_intent.gateway_ref -match "^SIM-PI-") "the intent reference crossed the seam"
+$orderId = $placed.order.id
+$gatewayRef = $placed.payment_intent.gateway_ref
+
+$eventBody = @{ gateway_event_id = "area-a-verify-evt-1"; type = "payment_intent.succeeded"; gateway_ref = $gatewayRef } | ConvertTo-Json -Compress
+$first = Invoke-RestMethod -Method Post -Uri "$base/api/payments/webhook" -ContentType "application/json" -Headers @{ "X-Webhook-Secret" = "edemand-webhook-secret" } -Body $eventBody
+Check ($first.settled -eq $true) "first gateway webhook settles the intent"
+$second = Invoke-RestMethod -Method Post -Uri "$base/api/payments/webhook" -ContentType "application/json" -Headers @{ "X-Webhook-Secret" = "edemand-webhook-secret" } -Body $eventBody
+Check ($second.replayed -eq $true) "replaying the same gateway event id is a 200 no-op"
+
+$detail = Invoke-RestMethod -Uri "$base/api/bookings/$orderId" -Headers @{ Authorization = "Bearer $nong" }
+Check ($detail.payment_status -eq "paid") "the payments service told the monolith to mark the order paid"
+Check ($detail.payment_intent.status -eq "succeeded") "the intent read back from the payments service is succeeded"
+
+Write-Host "== checking a wallet write crosses the boundary ==" -ForegroundColor Cyan
+$newEmail = "verify-provider-$([DateTimeOffset]::UtcNow.ToUnixTimeSeconds())@example.com"
+$regBody = @{ email = $newEmail; password = "VerifyPass123!"; name = "Verify Provider"; company_name = "Verify Co" } | ConvertTo-Json -Compress
+$registered = Invoke-RestMethod -Method Post -Uri "$base/api/auth/provider/register" -ContentType "application/json" -Body $regBody
+Check ($registered.id -gt 0) "provider registration succeeded"
+
+$paymentDbProbe = @'
+const { Pool } = require("pg");
+const pool = new Pool({ connectionString: process.env.DATABASE_URL });
+(async () => {
+  const charges = await pool.query("select count(*)::int as n from transactions where order_id = $1 and kind = 'charge'", [ORDER_ID]);
+  const wallet = await pool.query("select count(*)::int as n from provider_wallets where provider_id = $1", [PROVIDER_ID]);
+  const intents = await pool.query("select count(*)::int as n from payment_intents");
+  console.log(JSON.stringify({
+    charges: charges.rows[0].n,
+    wallet: wallet.rows[0].n,
+    intents: intents.rows[0].n
+  }));
+  await pool.end();
+})();
+'@
+$paymentDbProbe = $paymentDbProbe.Replace("ORDER_ID", [string]$orderId).Replace("PROVIDER_ID", [string]$registered.id)
+$b64PaymentProbe = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($paymentDbProbe))
+$paymentOut = (Invoke-Quietly { & docker compose exec -T payments node -e "eval(Buffer.from('$b64PaymentProbe','base64').toString())" }) -join ""
+$paymentResult = $paymentOut | ConvertFrom-Json
+Check ([int]$paymentResult.charges -eq 1) "payments DB has exactly one charge for the booking after the replay"
+Check ([int]$paymentResult.wallet -eq 1) "the new provider's wallet row is in the payments DB"
+Check ([int]$paymentResult.intents -ge 1) "the booking intent is stored in the payments DB"
 
 Write-Host ""
 Write-Host ("ALL AREA A CHECKS PASSED (" + $pass + " assertions)") -ForegroundColor Green

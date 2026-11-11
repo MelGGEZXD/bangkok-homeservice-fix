@@ -19,13 +19,14 @@ toward microservices. The bounded-context boundaries below **are** the future se
 
 - **The monolith is one deployable.** Next.js 14 App Router. UI pages are Server Components that
   call the service layer **directly, in-process** (the honest monolith read path). Mutations POST to
-  **route handlers** under `app/api/**`. The same code, one `node server.js`. Area A adds exactly
-  one extracted service beside it (Notifications) behind the gateway.
+  **route handlers** under `app/api/**`. The same code, one `node server.js`. Area A adds **two**
+  extracted services beside it (Notifications and Payments & Wallet) behind the gateway.
 - **The monolith owns one database.** `better-sqlite3`, one file `data/edemand.db` (`:memory:`
   under test). WAL, `foreign_keys=ON`. Dropped, migrated and **reseeded on every boot** — a fresh
   `docker compose up` is always identical. `sqlite_sequence` for `orders` is primed to 8000, so the
-  **first booking on a fresh boot is always id 8001**. The extracted notifications service owns a
-  **separate PostgreSQL database**; the monolith has no `notifications` table at all.
+  **first booking on a fresh boot is always id 8001**. The extracted services own **separate
+  PostgreSQL databases**; the monolith has no `notifications` table and none of the four money
+  tables (`payment_intents`, `transactions`, `provider_wallets`, `webhook_events`).
 - **Layered.** `route handler → service → repository → db`. No SQL outside repositories; no business
   logic in route files. Every route is zod-validated, typed-error-mapped, JWT+role-gated where
   required, and request-id + pino logged.
@@ -39,26 +40,33 @@ dependency, not part of the domain API surface.
 | Public URL | Routed to |
 |---|---|
 | `http://localhost:3000/api/notifications*` | Notifications service (`:3001`, own PostgreSQL DB) |
+| `http://localhost:3000/api/provider/wallet` | Payments & Wallet service (`:3002`, own PostgreSQL DB) |
+| `http://localhost:3000/api/customer/transactions` | Payments & Wallet service (`:3002`, own PostgreSQL DB) |
+| `http://localhost:3000/api/payments/webhook` | Payments & Wallet service (`:3002`, own PostgreSQL DB) |
 | `http://localhost:3000/*` | Next.js monolith (`:3000`, internal only — no published port) |
 | `http://localhost:8081` | Keycloak (realm `edemand`; admin console for the demo) |
 | `http://localhost:15672` | RabbitMQ management console (`edemand` / `edemand-demo-pass`) |
 
-```bash
-# Full stack: monolith + notifications service + PostgreSQL + Keycloak + RabbitMQ + nginx gateway
-docker compose up -d --build --wait      # http://localhost:3000
-docker compose run --rm test             # 71 tests, in-memory, no server needed
-docker compose down -v                   # also drops the notifications + RabbitMQ volumes
+`/api/internal/*` is refused by the gateway: those endpoints exist only on the compose network.
 
-# App-only local dev (monolith on :3000). The notifications API/UI returns 502 and the outbox does
-# not publish until the broker and service are running. Start them, then export RABBITMQ_URL:
-docker compose up -d rabbitmq notifications notifications-db
+```bash
+# Full stack: monolith + two extracted services + two PostgreSQL DBs + Keycloak + RabbitMQ + gateway
+docker compose up -d --build --wait      # http://localhost:3000
+docker compose run --rm test             # 75 tests, in-memory, no server needed
+docker compose down -v                   # also drops the notifications, payments and RabbitMQ volumes
+
+# App-only local dev (monolith on :3000). Extracted-service calls return 502 until they run. Start
+# the dependencies, then export RABBITMQ_URL and the service URLs:
+docker compose up -d rabbitmq notifications notifications-db payments payments-db
 export RABBITMQ_URL=amqp://edemand:edemand-demo-pass@localhost:5672
+export NOTIFICATIONS_SERVICE_URL=http://localhost:3001 PAYMENTS_SERVICE_URL=http://localhost:3002
 npm install
 npm run dev
 # or: npm run build && npm start
 
-# Notifications service by itself (needs a PostgreSQL DATABASE_URL, KEYCLOAK_URL and RABBITMQ_URL)
+# Each extracted service by itself (needs DATABASE_URL + KEYCLOAK_URL; notifications also RABBITMQ_URL)
 cd notifications-service && npm install && DATABASE_URL=postgres://... KEYCLOAK_URL=... RABBITMQ_URL=... npm start
+cd payments-service      && npm install && DATABASE_URL=postgres://... KEYCLOAK_URL=... npm start
 ```
 
 Secrets are environment variables. The compose defaults are **demo-only**; override
@@ -91,7 +99,7 @@ tables through its own repository; it goes through the owning context's service/
 | 3 | **Provider Profile** | `provider_profiles`, `provider_timings` | Approval, commission, 30-min weekly availability. |
 | 4 | **Booking** | `orders`, `order_items`, `slot_holds`, `addresses` | The place-booking transaction, the status machine, OTP-gated completion, slots. |
 | 5 | **Bidding** | `job_requests`, `bids` | Custom jobs + provider bids; the bid-accept race that spins up a booking. |
-| 6 | **Payments & Wallet** | `payment_intents`, `transactions`, `provider_wallets`, `webhook_events` | Gateway intents, the idempotent webhook, the commission split. |
+| 6 | **Payments & Wallet** | `payment_intents`, `transactions`, `provider_wallets`, `webhook_events` in its **own PostgreSQL DB** (extracted) | Gateway intents, the idempotent webhook, the commission split. Money writes are idempotent by order and kind. |
 | 7 | **Reviews** | `reviews` | One review per completed booking; emits `review.created`. |
 | 8 | **Notifications** | `notifications` in its **own PostgreSQL DB** (extracted) | Read side + ownership check in the service. Consumes domain events from RabbitMQ and owns the event → notification projection. |
 
@@ -107,15 +115,27 @@ lib/
   db/                index, schema, migrate, seed, bootstrap, idempotency, events
   messaging/         rabbit.js (connection + confirms), publisher.js (outbox -> broker)
   modules/<context>/ repository.js + service.js  (+ booking/slots.js, booking/availability.js,
-                                                   payments/gateway.js, notifications/relay.js,
+                                                   payments/client.js, notifications/relay.js,
                                                    notifications/client.js, sagas/*)
 notifications-service/  extracted Express service: server.js, app.js, db.js (PostgreSQL), auth.js,
                         broker.js (RabbitMQ consumer), notification-rules.cjs, faults.js
-gateway/nginx.conf      the Area A gateway: /api/notifications -> service, everything else -> monolith
+payments-service/       extracted Express service: server.js, app.js, db.js (PostgreSQL), auth.js,
+                        keycloak.js (JWKS verifier), config.js
+gateway/nginx.conf      the Area A gateway: each extracted prefix -> its service, else -> monolith
 test/ test-helpers/     node:test suite driving the real route handlers in-process
 ```
 
-### Area A — Notifications extracted (working-alone scope)
+### Area A — two extractions (team scope)
+
+A team of 4–5 must move **two** parts, each into its own service with its own database, and at
+least one must change data rather than only read it. This repository ships both:
+
+| Extracted service | Public prefix | Own database | Writes data? |
+|---|---|---|---|
+| Notifications | `/api/notifications*` | `notifications_db` | yes: creates and marks notifications |
+| Payments & Wallet | `/api/provider/wallet`, `/api/customer/transactions`, `/api/payments/webhook` | `payments_db` | yes: payment intents, ledger entries, wallet balances, webhook dedupe |
+
+#### Area A.1 — Notifications
 
 | The four boundary questions | Answer |
 |---|---|
@@ -174,13 +194,69 @@ curl -s -H "authorization: Bearer $GLOW" http://localhost:3000/api/notifications
 Expected: one `provider_approved` notification, served from PostgreSQL by the extracted service.
 The monolith's SQLite file has no `notifications` table.
 
+#### Area A.2 — Payments & Wallet
+
+| The four boundary questions | Answer |
+|---|---|
+| **Name** | Payments & Wallet |
+| **What crosses** | *Inbound from the monolith:* `POST /internal/payment-intents`, `POST /internal/wallets`, `POST /internal/ledger/booking-completed`, `POST /internal/ledger/booking-cancelled`, `POST /internal/simulate` (shared `X-Internal-Key`). *Inbound from clients:* `GET /api/provider/wallet`, `GET /api/customer/transactions` (JWT, verified by the service) and `POST /api/payments/webhook` (shared `X-Webhook-Secret`). *Outbound:* `POST /api/internal/orders/:id/payment-status` so the order owner learns the money settled. |
+| **Ownership** | The service owns `payment_intents`, `transactions`, `provider_wallets` and `webhook_events` in **`payments_db`**. The monolith schema drops all four and has no payments repository. |
+| **Decision** | Second extraction because it is the highest-write context with a genuinely separate aggregate: money rows never need a join back into `orders`. It also gives Area D a real idempotency target and Area C a real participant. |
+
+Why this one, not Catalog/Provider? Provider data is joined by `services`, `orders`, `bids` and
+`job_requests`; extracting it first forces cross-service reads into the hot booking path. Money
+rows are referenced only by `order_id`, so the seam is narrow and the write volume justifies the
+split.
+
+What makes the cut real:
+
+- **Same public addresses.** The wallet, ledger and webhook URLs are unchanged; nginx routes those
+  prefixes to `payments:3002`. `/api/payments/simulate` deliberately stays on the monolith, because
+  only the monolith owns `orders` and can prove the caller is the customer before money moves.
+- **The monolith really cannot touch the rows.** `lib/db/schema.js` drops and does not recreate the
+  four tables, and `lib/modules/payments/` contains only an HTTP client — no SQL. Provider
+  registration calls `POST /internal/wallets`; booking completion calls the ledger endpoint.
+- **Exactly-once money writes.** `payment_intents.order_id` is `UNIQUE` (a retried booking cannot
+  create two intents) and `transactions(order_id, kind)` is `UNIQUE` (a redelivered webhook or a
+  retried completion cannot double-credit). `webhook_events.gateway_event_id` is the replay key.
+- **The service checks the token itself.** `payments-service/auth.js` verifies the Keycloak RS256
+  token against the realm JWKS, derives the provider/customer id from `local_id`, and returns 403
+  when the role does not match the route.
+- **Order state stays with the order owner.** After the money transaction commits, the service calls
+  the monolith's internal, idempotent settlement endpoint. The `orders.payment_status` update is
+  conditional, and the `payment.succeeded` outbox event is emitted only on the first transition.
+
+Proof from the running stack:
+
+```bash
+docker compose up -d --build --wait
+
+# 1. The payments service answers this 401 itself (no monolith requestId in the body).
+curl -i http://localhost:3000/api/provider/wallet
+
+# 2. A provider token reads its own wallet from PostgreSQL.
+SPARKLE=$(curl -s -X POST http://localhost:3000/api/auth/provider/login \
+  -H 'content-type: application/json' \
+  -d '{"email":"sparkle@example.com","password":"eDemand-2026!"}' | jq -r .token)
+curl -s -H "authorization: Bearer $SPARKLE" http://localhost:3000/api/provider/wallet
+
+# 3. A gateway webhook settles a booking once; the same event id again is a 200 no-op.
+curl -s -X POST http://localhost:3000/api/payments/webhook \
+  -H 'content-type: application/json' -H 'x-webhook-secret: edemand-webhook-secret' \
+  -d '{"gateway_event_id":"evt-1","type":"payment_intent.succeeded","gateway_ref":"SIM-PI-..."}'
+```
+
+The full proof — including one-charge-after-replay and the wallet row appearing in `payments_db` —
+is `scripts/verify-area-a.ps1`. Reset with `docker compose down -v`, which drops both extracted
+databases as well as RabbitMQ.
+
 ### Area B — Keycloak tokens, ownership, and the BOLA fix
 
 | Question | Answer |
 |---|---|
 | **Who issues tokens?** | Keycloak 26.0, realm `edemand`, imported from `keycloak/realm-edemand.json` on every clean boot. The monolith never signs a production token. |
 | **What is in the token?** | RS256 access token with `iss=http://localhost:8081/realms/edemand`, `aud` containing `edemand-api`, and two custom claims mapped from Keycloak user attributes: `local_id` (the monolith's numeric user id) and `role` (`customer` / `provider` / `admin`). |
-| **Who verifies it?** | Both services, independently. The monolith (`lib/http/keycloak.js`) and the notifications service (`notifications-service/keycloak.js`) fetch the realm JWKS at boot with retries, cache keys by `kid`, and verify signature + issuer + audience + expiry locally. There is no shared signing secret. |
+| **Who verifies it?** | All three processes, independently. The monolith (`lib/http/keycloak.js`), the notifications service (`notifications-service/keycloak.js`) and the payments service (`payments-service/keycloak.js`) fetch the realm JWKS at boot with retries, cache keys by `kid`, and verify signature + issuer + audience + expiry locally. There is no shared signing secret. |
 | **What about ownership?** | The notifications service derives the recipient from the verified token (`local_id`, `role`) and never from a path/query parameter. Mark-read checks `recipient_id`/`recipient_role` and returns 403 for anyone else. |
 
 **Clients in the realm** (all public, password grant enabled, so the demo can request real tokens):
@@ -427,7 +503,7 @@ real metrics dashboards, contract tests in CI, real payment gateways, chat, cart
 ## Tests
 
 `node --test`, no socket — the suite imports the real App Router route handlers and drives them
-in-process against per-file in-memory databases. 71 tests across:
+in-process against per-file in-memory databases. 75 tests across:
 
 `health` · `identity` (auth, 401/403/400/409) · `catalog` (pagination, ownership) · `booking`
 (id 8001, the slot double-book race, idempotency, the full status machine, OTP-gated complete +

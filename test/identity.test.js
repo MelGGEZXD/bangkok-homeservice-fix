@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { freshBoot, getDb } from "../test-helpers/boot.js";
 import { call } from "../test-helpers/call.js";
 import { registerCustomer, registerProvider } from "../test-helpers/auth.js";
+import { fakeWallet } from "../test-helpers/payments.js";
 
 import * as customerRegister from "../app/api/auth/customer/register/route.js";
 import * as customerLogin from "../app/api/auth/customer/login/route.js";
@@ -44,14 +45,20 @@ test("identity", async (t) => {
     assert.ok(Array.isArray(res.body.details));
   });
 
-  await t.test("provider register also creates provider_profiles + provider_wallets", async () => {
+  await t.test("provider register creates a local profile and a wallet in the payments service", async () => {
     const p = await registerProvider();
     const profile = getDb().prepare("SELECT * FROM provider_profiles WHERE provider_id = ?").get(p.id);
-    const wallet = getDb().prepare("SELECT * FROM provider_wallets WHERE provider_id = ?").get(p.id);
-    assert.ok(profile, "expected a provider_profiles row");
+    assert.ok(profile, "expected a provider_profiles row in the monolith");
     assert.equal(profile.is_approved, 0);
-    assert.ok(wallet, "expected a provider_wallets row");
+    // The wallet is NOT in this database any more: it crossed the Area A seam.
+    assert.equal(
+      getDb().prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='provider_wallets'").get(),
+      undefined,
+      "monolith must not own provider_wallets"
+    );
+    const wallet = fakeWallet(p.id);
     assert.equal(wallet.balance_cents, 0);
+    assert.equal(wallet.commission_owed_cents, 0);
     assert.equal(p.is_approved, false);
   });
 
