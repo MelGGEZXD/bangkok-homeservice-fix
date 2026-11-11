@@ -54,6 +54,17 @@ CREATE TABLE IF NOT EXISTS webhook_events (
   received_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   processed_at TIMESTAMPTZ
 );
+
+-- Area D: transport-level idempotency. The monolith sends one key per logical write and reuses it
+-- on every retry (and on a later reconciliation replay). The stored response is returned verbatim,
+-- so a retried request is observed once. The domain UNIQUE keys remain the last line of defence.
+CREATE TABLE IF NOT EXISTS idempotency_keys (
+  key TEXT PRIMARY KEY,
+  endpoint TEXT NOT NULL,
+  status_code INTEGER NOT NULL,
+  response_json JSONB NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
 `;
 
 let pool;
@@ -188,6 +199,24 @@ async function markWebhookProcessed(gatewayEventId, client = getPool()) {
   );
 }
 
+// ---- transport idempotency ------------------------------------------------------------------
+async function findIdempotencyKey(key, client = getPool()) {
+  const { rows } = await client.query(
+    "SELECT key, endpoint, status_code, response_json FROM idempotency_keys WHERE key = $1",
+    [key]
+  );
+  return rows[0] || null;
+}
+
+async function saveIdempotencyKey(key, endpoint, statusCode, body, client = getPool()) {
+  await client.query(
+    `INSERT INTO idempotency_keys (key, endpoint, status_code, response_json)
+     VALUES ($1, $2, $3, $4)
+     ON CONFLICT (key) DO NOTHING`,
+    [key, endpoint, statusCode, JSON.stringify(body)]
+  );
+}
+
 async function closeDb() {
   if (pool) {
     await pool.end();
@@ -212,4 +241,6 @@ module.exports = {
   listTransactionsForCustomer,
   recordWebhookEvent,
   markWebhookProcessed,
+  findIdempotencyKey,
+  saveIdempotencyKey,
 };

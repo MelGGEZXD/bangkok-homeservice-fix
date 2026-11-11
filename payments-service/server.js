@@ -2,9 +2,13 @@
 const { createApp } = require("./app");
 const { getPool, initDb, closeDb } = require("./db");
 const { initKeycloak } = require("./keycloak");
+const { startTelemetry } = require("./telemetry");
 const config = require("./config");
 
 async function main() {
+  // Area E: register the tracer provider before any request can create a span. No-op unless
+  // OTEL_EXPORTER_OTLP_ENDPOINT is set.
+  startTelemetry("payments");
   // Area B: fail closed if Keycloak is not configured or its keys cannot be loaded.
   await initKeycloak();
   await initDb();

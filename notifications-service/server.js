@@ -3,9 +3,12 @@ const { createApp } = require("./app");
 const { getPool, initDb, closeDb } = require("./db");
 const { initKeycloak } = require("./keycloak");
 const { startBroker, stopBroker } = require("./broker");
+const { startTelemetry } = require("./telemetry");
 const config = require("./config");
 
 async function main() {
+  // Area E: register the tracer provider before serving or consuming anything.
+  startTelemetry("notifications");
   // Area B: fail closed if Keycloak is not configured or its keys cannot be loaded.
   await initKeycloak();
   await initDb();

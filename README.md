@@ -46,14 +46,20 @@ dependency, not part of the domain API surface.
 | `http://localhost:3000/*` | Next.js monolith (`:3000`, internal only — no published port) |
 | `http://localhost:8081` | Keycloak (realm `edemand`; admin console for the demo) |
 | `http://localhost:15672` | RabbitMQ management console (`edemand` / `edemand-demo-pass`) |
+| `http://localhost:16686` | Jaeger trace UI (Area E) |
+| `http://localhost:9090` | Prometheus (Area E; scrapes all three services) |
+| `http://localhost:3005` | Grafana (Area E; anonymous admin, dashboard pre-provisioned) |
 
-`/api/internal/*` is refused by the gateway: those endpoints exist only on the compose network.
+`/api/internal/*`, `/internal/*` and `/metrics` are refused by the gateway: those endpoints exist
+only on the compose network.
 
 ```bash
-# Full stack: monolith + two extracted services + two PostgreSQL DBs + Keycloak + RabbitMQ + gateway
+# Full stack: monolith + two extracted services + two PostgreSQL DBs + Keycloak + RabbitMQ +
+# Jaeger + Prometheus + Grafana + gateway
 docker compose up -d --build --wait      # http://localhost:3000
-docker compose run --rm test             # 75 tests, in-memory, no server needed
-docker compose down -v                   # also drops the notifications, payments and RabbitMQ volumes
+docker compose run --rm test             # 76 unit/concurrency tests, in-memory, no server needed
+docker compose down -v                   # first boot: drops both extracted DBs, RabbitMQ and Grafana
+```
 
 # App-only local dev (monolith on :3000). Extracted-service calls return 502 until they run. Start
 # the dependencies, then export RABBITMQ_URL and the service URLs:
@@ -398,6 +404,263 @@ deterministic. The broker is not a second source of truth: the outbox is.
 
 ---
 
+### Area D — timeouts, retries, idempotency, and one repaired race
+
+Area D makes the **monolith → Payments & Wallet** seam survive the three failures the brief names.
+The seam is used by booking completion (payout/commission) and cancellation (refund); the demo uses
+completion because it changes money and is easy to observe.
+
+| Injected failure | What happens at the seam | Why the caller survives |
+|---|---|---|
+| **Reply lost after the write** (`lost_reply`) | Payments commits the ledger row and the idempotency record, then destroys the socket before the response is written. | The client sees a transport error, backs off and retries with the **same** `Idempotency-Key`. Payments finds the stored response and replays it. One effect. |
+| **Reply slower than the timeout** (`slow_reply_ms`) | Payments commits, then holds the response past the client's 3s timeout. | The client times out, retries with the same key; the stored response is returned immediately. The first, late response writes to a dead socket and is ignored. One effect. |
+| **Service unavailable for a window** (`outage_ms`) | Every request fails with 503 before any write. | The order commit is already durable and includes a `ledger_commands` row. The response does not fail; the background reconciler replays the command after the outage ends. One effect. |
+
+**Timeout + retry + jitter** live in `lib/modules/payments/client.js`:
+
+```js
+AbortSignal.timeout(config.paymentsTimeoutMs)              // 3000 ms
+config.paymentsMaxAttempts                                  // 3 attempts
+delay = random() * min(4000, 250 * 2^(attempt-1))           // exponential, full jitter
+```
+
+Only transport failures, timeouts and 5xx are retried; a 4xx is a decision and escapes at once.
+Full jitter is deliberate: a fleet that retries in lockstep after an outage creates the next
+outage. Jitter spreads the retries over the backoff window.
+
+**Two layers of idempotency, on purpose.**
+
+1. *Transport* — every logical write gets one key (`payment-intent:<order>`,
+   `booking-completed:<order>`, `webhook:<gateway_event_id>`, …). Payments stores it in
+   `idempotency_keys(key PRIMARY KEY)` together with the response and returns that response on a
+   replay. Retries and reconciliation attempts are therefore observed once.
+2. *Domain* — the money tables keep their own UNIQUE keys: `payment_intents.order_id`,
+   `transactions(order_id, kind)` and `webhook_events.gateway_event_id`. Even two different keys
+   that race cannot double-credit, because the database refuses the second row.
+
+**Durability before the network call.** Completing or cancelling a booking writes the order change,
+the outbox event and a `ledger_commands` row in the **same SQLite transaction**
+(`lib/modules/booking/service.js`, `lib/modules/payments/ledger-queue.js`). The direct HTTP call is
+only the low-latency path; if it fails, the row stays pending and
+`startLedgerReconciler()` (started in `instrumentation.js`) retries it every 3 seconds until the
+payments service acknowledges it. A payments outage delays the wallet update but cannot lose it.
+
+**The unsafe race that was fixed.** Registering a customer or provider was a read-then-write:
+`findCustomerByEmail()` followed by `INSERT`. Two requests arriving together both read “no such
+email”, both insert, and the UNIQUE(email) index rejects the second — but the raw
+`SQLITE_CONSTRAINT_UNIQUE` became a **500** instead of the 409 the sequential path returns.
+The fix in `lib/modules/identity/repository.js` lets the index be the arbiter and translates the
+constraint into `ConflictError` (409). It is proven by `test/identity-race.test.js`, which opens two
+worker threads on the same file database, holds `BEGIN IMMEDIATE` while both pass the advisory
+check, then releases the lock: exactly one registration wins, the other is a clean 409, and one row
+exists. The test was run with the translation disabled to confirm it fails with the raw SQLite
+error before the fix.
+
+**Proof.** `scripts/beat2-failure-recovery.sh` arms each switch through the internal-only control
+endpoint, completes a real booking, and asserts the order stays completed, the wallet has exactly
+one ledger row for that order, and the durable command is marked done. It passes 20 assertions on
+a clean boot. The race proof is part of `npm test` and CI.
+
+**Tradeoff accepted.** The reconciler is in-process and polls every 3 seconds, so a recovery is
+“seconds, not milliseconds”, and a total monolith outage pauses reconciliation until it restarts.
+The alternative — a separate queue worker/CDC — is more moving parts than a two-step money write
+needs at this size. What matters is that the command is durable first and retried later, not that
+the retry is instantaneous.
+
+### Area E — traces, metrics, dashboard, and contract tests
+
+**One trace across both seams.** OpenTelemetry is wired in all three processes:
+
+- `lib/telemetry.js`, `payments-service/telemetry.js`, `notifications-service/telemetry.js`
+- the monolith starts a SERVER span in `lib/http/handle.js` and returns `x-trace-id` plus a W3C
+  `traceparent` header;
+- the payments client injects the current `traceparent` on every outbound HTTP call, so the
+  payments SERVER span is a child of the monolith route span;
+- `events.trace_parent` stores the trace of the request that wrote the outbox row. The relay starts
+  a PRODUCER span parented to it, and `lib/messaging/rabbit.js` puts that `traceparent` in the
+  RabbitMQ message headers;
+- the notifications consumer starts a CONSUMER span from the header, and carries the trace into
+  `notification.created` / `notification.failed`; the monolith's saga consumer continues it.
+
+The result is visible in Jaeger: one trace containing `POST /api/bookings` (edemand),
+`POST /internal/payment-intents` (payments), `publish booking.status_changed` (edemand) and
+`process booking.status_changed` (notifications). `scripts/beat4-find-the-trace.sh` asserts the
+three services are present and that every child span points at a parent in the same trace.
+
+Tracing is **off unless `OTEL_EXPORTER_OTLP_ENDPOINT` is set**, so `node --test` and a bare
+`npm run dev` do not emit spans. Compose points all three services at `http://jaeger:4318`; the UI
+is `http://localhost:16686`.
+
+**Metrics and dashboard.** Each service exposes `/metrics` in Prometheus format. `nginx` returns
+404 for `/metrics` and `/internal`, so they are reachable only on the compose network. The shared
+metric names are:
+
+| Metric | Labels | Used for |
+|---|---|---|
+| `http_requests_total` | `service`, `method`, `route`, `status` | request rate and 5xx ratio |
+| `http_request_duration_seconds` | `service`, `method`, `route`, `status` | p95 response time |
+| `notifications_events_projected_total` | `service`, `event_type`, `outcome` | consumer progress and injected failures |
+
+Route labels are normalised (`/api/bookings/8001` → `/api/bookings/:id`), so ids do not explode the
+time-series count. Prometheus scrapes all three targets every 5s; Grafana is provisioned from
+`observability/` with one dashboard, **eDemand — services at a glance**, containing request rate,
+error rate and p95 latency per service. Open `http://localhost:3005`.
+
+**Contract tests.** Pact consumer tests live in `test/pact/`:
+
+- `notifications.pact.test.js` drives the real monolith client against a Pact mock and pins the
+  inbox response shape and the forwarded bearer token;
+- `payments.pact.test.js` pins `POST /internal/payment-intents` (including the
+  `Idempotency-Key` header) and `GET /api/provider/wallet`.
+
+They write `pacts/edemand-monolith-{notifications,payments}-service.json`. Run them with
+`npm run test:pact`. `.github/workflows/ci.yml` runs the unit suite, the contract job and a
+production build; the contract job was executed locally with:
+
+```bash
+act pull_request -j contracts
+```
+
+`act` does not provide GitHub's artifact service, so the upload step is guarded with
+`if: ${{ env.ACT != 'true' }}`; the job still fails the run if a contract breaks.
+
+---
+
+## Demo scripts — the four beats
+
+Run them in order on a clean boot (`docker compose down -v && docker compose up -d --build --wait`).
+Each script waits for health, prints one `PASS` line per assertion, and exits non-zero on a
+mismatch. They use only `curl`, `node` and the compose stack.
+
+### 1. `scripts/beat1-happy-path.sh`
+
+One request path across every boundary: the notifications service refuses an anonymous call, admin
+approval drives the saga and the RabbitMQ projection, a gateway booking creates a payment intent,
+“Pay now” settles it, and OTP completion writes one payout row in Payments.
+
+```bash
+bash scripts/beat1-happy-path.sh
+```
+
+Expected (ids differ per boot):
+
+```
+PASS  stack healthy at http://localhost:3000/api/health
+PASS  unauthenticated inbox is 401 at the service
+PASS  401 body came from the notifications service, not the monolith
+PASS  admin approved provider Glow (id 3)
+PASS  saga <uuid> completed after notification.created
+PASS  Glow's provider_approved notification is readable through the extracted service
+PASS  placed gateway booking 8001 (HTTP seam to payments)
+PASS  pay-now settled the intent through the payments service
+PASS  the order owner sees payment_status=paid
+PASS  provider completed booking 8001 with the OTP
+PASS  payments holds exactly one payout_credit row for order 8001
+PASS  the wallet row carries the order's provider earnings (109140 cents)
+
+BEAT 1 PASSED (12 assertions)
+```
+
+On a second run without a reset, Glow is already approved; the script says so and still proves the
+inbox and the remaining beats.
+
+### 2. `scripts/beat2-failure-recovery.sh`
+
+The three Area D failures, each survived with exactly one wallet effect. The switches are internal
+and reset automatically when the script exits.
+
+```bash
+bash scripts/beat2-failure-recovery.sh
+```
+
+Expected:
+
+```
+== lost reply after the write: order 8002 ==
+PASS  completion survived 'lost reply after the write' (HTTP 200 after 162ms)
+PASS  order 8002 is completed, not rolled back
+PASS  payments holds exactly one ledger row for order 8002 after recovery
+PASS  the durable ledger command is marked done once
+
+== reply slower than the timeout: order 8003 ==
+PASS  completion survived 'reply slower than the timeout' (HTTP 200 after 3230ms)
+PASS  the client waited for the 5000ms response and then retried
+PASS  payments holds exactly one ledger row for order 8003 after recovery
+
+== payments fails for a time window: order 8004 ==
+PASS  completion survived 'payments fails for a time window' (HTTP 200 after 616ms)
+PASS  payments holds exactly one ledger row for order 8004 after recovery
+
+BEAT 2 PASSED (20 assertions)
+One order, one wallet effect, in every failure mode.
+```
+
+### 3. `scripts/beat3-auth-rejection.sh`
+
+Real Keycloak token accepted by both boundaries; forged, expired and wrong-audience tokens rejected
+with 401 by the monolith **and** the extracted services; ownership enforced; and the inherited
+`GET /api/jobs/{id}` BOLA attack returns 403 where it used to return 200.
+
+```bash
+bash scripts/beat3-auth-rejection.sh
+```
+
+Expected:
+
+```
+PASS  token issuer is Keycloak
+PASS  the monolith accepts the real token
+PASS  the extracted service verifies the same token itself
+PASS  monolith rejects a forged signature
+PASS  extracted service rejects a forged signature
+PASS  monolith rejects a token for the wrong audience
+PASS  extracted service rejects a token for the wrong audience
+PASS  monolith rejects an expired token
+PASS  extracted service rejects an expired token
+PASS  another user cannot mark Glow's notification read
+PASS  an unrelated customer cannot read the job (was 200 before the fix)
+PASS  the owner still reads the job
+
+AREA B PASSED (17 assertions)
+```
+
+### 4. `scripts/beat4-find-the-trace.sh`
+
+Makes one gateway booking and finds the same request in Jaeger after the asynchronous half has run.
+A marker can open the printed URL and see all three services in one trace.
+
+```bash
+bash scripts/beat4-find-the-trace.sh
+```
+
+Expected:
+
+```
+PASS  response carries a 32-hex x-trace-id (<trace-id>)
+PASS  the same response carries a W3C traceparent (00-<trace-id>-<span-id>-01)
+PASS  the monolith contributed spans
+PASS  the payments service continued the HTTP trace
+PASS  the notifications service continued the RabbitMQ trace
+ORPHANS=0
+SPANS
+  edemand        POST /api/bookings (...ms)
+  edemand        fetch POST http://payments:3002/internal/payment-intents (...ms)
+  payments       POST /internal/payment-intents (...ms)
+  edemand        publish booking.status_changed (...ms)
+  notifications  process booking.status_changed (...ms)
+PASS  every child span points at a parent in the same trace
+
+BEAT 4 PASSED (12 assertions)
+Open the trace: http://localhost:16686/trace/<trace-id>
+Grafana (request rate, error rate, p95 latency per service): http://localhost:3005
+```
+
+**Reset between runs.** `docker compose down -v` is the canonical first boot: it drops
+`notifications-db-data`, `payments-db-data`, `rabbitmq-data` and `grafana-data`. The monolith reseeds
+SQLite on every start, so booking ids return to 8001.
+
+---
+
 ## Seam analysis — what extracts first, and why
 
 The boundaries are drawn so a context can be lifted into its own service with a known, small set of
@@ -448,7 +711,7 @@ Each is a genuine mechanism, not a stub, and each has a test proving it.
   the `UPDATE ... WHERE status='started' AND otp=?` — so a replay (or a second provider) matches zero
   rows and **the balance is credited exactly once**. Commission split: gateway → provider balance;
   COD → commission owed to the platform (`total*pct/100`).
-- **Payment-webhook idempotency** (`payments/service.js#handleWebhook`). The gateway's
+- **Payment-webhook idempotency** (`payments-service/app.js#settleWebhook`). The gateway's
   `gateway_event_id` is the dedupe key (`webhook_events.gateway_event_id UNIQUE`). A replayed callback
   short-circuits and credits nothing twice. (Contrast: the real product has no idempotency and
   double-processes retries.)
@@ -494,16 +757,16 @@ Each is a genuine mechanism, not a stub, and each has a test proving it.
   realm is imported from a committed JSON file, and the demo uses a published hostname
   (`localhost:8081`) rather than a production ingress with TLS.
 
-Out of scope by design (course adds later): fault injection at the HTTP edge, distributed tracing,
-real metrics dashboards, contract tests in CI, real payment gateways, chat, cart, subscriptions.
-`SOAP`/`WSDL` appear nowhere.
+Out of scope by design (course adds later): real payment gateways, chat, cart, subscriptions,
+multi-region deployment. `SOAP`/`WSDL` appear nowhere.
 
 ---
 
 ## Tests
 
 `node --test`, no socket — the suite imports the real App Router route handlers and drives them
-in-process against per-file in-memory databases. 75 tests across:
+in-process against per-file in-memory databases. **78 tests** (76 functional + the 2 Pact contract
+files) across:
 
 `health` · `identity` (auth, 401/403/400/409) · `catalog` (pagination, ownership) · `booking`
 (id 8001, the slot double-book race, idempotency, the full status machine, OTP-gated complete +
@@ -513,7 +776,15 @@ relay idempotent, exactly one notification delivered across the boundary) · `ad
 `provider.approved` atomically, the monolith owns no notifications table, relay delivers once) ·
 `area-c-events` (outbox + publisher, duplicate delivery has one effect, `notification.created`
 completes the saga, `booking.status_changed` as a second event, `notification.failed` compensates by
-unapproving the provider, retry succeeds).
+unapproving the provider, retry succeeds) · `identity-race` (two worker threads race one email through
+a held `BEGIN IMMEDIATE` lock: one 201, one clean 409, one row — the Area D race fix) ·
+`notifications` / `payments` Pact consumer contracts (`test/pact/`, `npm run test:pact` — also a
+separate `contracts` CI job run locally with `act`).
+
+The Area D retry/timeout/durability behaviour is proven end-to-end on the compose stack by
+`scripts/beat2-failure-recovery.sh`: three real injected failures, and in each one exactly one
+ledger row and one completed order. Unit tests do not fake the payments service for this, because
+the interesting part is the wire.
 
 The broker itself is not started by `node:test`; `test-helpers/notifications.js` installs an
 in-process publisher that runs the **same** projection rules as the service

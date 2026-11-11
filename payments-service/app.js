@@ -13,6 +13,7 @@
 //   POST   /internal/ledger/booking-completed        -> exactly-once payout / commission entry
 //   POST   /internal/ledger/booking-cancelled        -> exactly-once refund entry
 //   POST   /internal/simulate                        -> mock gateway "pay now" for a booking
+//   GET/POST /internal/faults                        -> Area D fault switches (demo only)
 //
 // Nothing in this file reads the monolith's database. When money settles, the service tells the
 // monolith (which still owns orders) over an idempotent internal endpoint.
@@ -22,6 +23,9 @@ const { z } = require("zod");
 const { requireUser, requireRole } = require("./auth");
 const config = require("./config");
 const db = require("./db");
+const faults = require("./faults");
+const { tracingMiddleware, traceparentFromActive } = require("./telemetry");
+const { metricsMiddleware, registry } = require("./metrics");
 
 const intentCommand = z.object({
   order_id: z.coerce.number().int().positive(),
@@ -55,6 +59,13 @@ const webhookCommand = z.object({
 });
 
 const simulateCommand = z.object({ order_id: z.coerce.number().int().positive() });
+
+const faultCommand = z.object({
+  reset: z.boolean().optional(),
+  lost_reply: z.boolean().optional(),
+  slow_reply_ms: z.coerce.number().int().min(0).max(60000).optional(),
+  outage_ms: z.coerce.number().int().min(0).max(120000).optional(),
+});
 
 function toTransaction(row) {
   return {
@@ -101,17 +112,57 @@ function requireInternalKey(req, res, next) {
   return next();
 }
 
+// The control surface must stay reachable while a fault is injected, otherwise the demo could not
+// turn the failure off again.
+function isControlPath(req) {
+  return (
+    req.path === "/health" ||
+    req.path === "/metrics" ||
+    req.path.startsWith("/internal/faults")
+  );
+}
+
+// Transport-level idempotency (Area D). A retried write carries the same key; the stored response is
+// returned instead of running the handler a second time. The domain UNIQUE keys still protect two
+// different keys that race, so this is an optimisation and an audit trail, not the only guard.
+async function respondIdempotent(req, res, endpoint, perform) {
+  const key = req.headers["idempotency-key"];
+  if (!key) {
+    const out = await perform();
+    return res.status(out.status).json(out.body);
+  }
+
+  const existing = await db.findIdempotencyKey(key);
+  if (existing) {
+    if (existing.endpoint !== endpoint) {
+      return res
+        .status(409)
+        .json({ error: "Idempotency-Key has already been used for a different request" });
+    }
+    res.setHeader("idempotent-replay", "true");
+    return res.status(existing.status_code).json(existing.response_json);
+  }
+
+  const out = await perform();
+  await db.saveIdempotencyKey(key, endpoint, out.status, out.body);
+  return res.status(out.status).json(out.body);
+}
+
 // After the money state commits, tell the order owner. This is idempotent on the monolith side and
 // is safe to repeat, which is what lets the webhook retry path heal a lost reply.
 async function notifyOrderPayment(orderId, paymentStatus, gatewayRef) {
+  const headers = {
+    "content-type": "application/json",
+    "x-internal-key": config.internalApiKey,
+  };
+  const traceparent = traceparentFromActive();
+  if (traceparent) headers.traceparent = traceparent;
+
   let res;
   try {
     res = await fetch(`${config.bookingServiceUrl}/api/internal/orders/${orderId}/payment-status`, {
       method: "POST",
-      headers: {
-        "content-type": "application/json",
-        "x-internal-key": config.internalApiKey,
-      },
+      headers,
       body: JSON.stringify({ payment_status: paymentStatus, gateway_ref: gatewayRef }),
       signal: AbortSignal.timeout(config.bookingTimeoutMs),
     });
@@ -187,7 +238,59 @@ function createApp(pool) {
     next();
   });
 
+  // Area E: one SERVER span per request; the response carries its traceparent so a demo can find
+  // the trace without guessing, and the outbound notify call continues the same context.
+  app.use(tracingMiddleware("payments"));
+  app.use(metricsMiddleware("payments"));
   app.use(express.json({ limit: "64kb" }));
+
+  // Area D fault injection, applied to everything except the switches themselves, health and
+  // metrics. The outage is checked first because it must fail before any write happens.
+  app.use((req, res, next) => {
+    if (isControlPath(req)) return next();
+    if (faults.outageActive()) {
+      res.setHeader("retry-after", "1");
+      return res.status(503).json({ error: "payments service unavailable (injected outage)" });
+    }
+    return next();
+  });
+
+  app.use((req, res, next) => {
+    if (isControlPath(req)) return next();
+
+    // lost_reply: the handler commits, then the socket disappears before the response is written.
+    if (faults.consumeLostReply()) {
+      const json = res.json.bind(res);
+      res.json = () => {
+        req.socket.destroy();
+        return res;
+      };
+      // If a handler ends with res.end() instead of res.json(), still lose the reply.
+      const end = res.end.bind(res);
+      res.end = (...args) => {
+        req.socket.destroy();
+        return end(...args);
+      };
+      return next();
+    }
+
+    // slow_reply: the handler commits, then the response is held past the client's timeout. The
+    // client retries; the stored idempotency row makes the retry cheap and exactly-once.
+    const delay = faults.takeSlowReplyMs();
+    if (delay > 0) {
+      const json = res.json.bind(res);
+      res.json = (body) => {
+        setTimeout(() => json(body), delay);
+        return res;
+      };
+    }
+    return next();
+  });
+
+  app.get("/metrics", async (_req, res) => {
+    res.setHeader("content-type", registry.contentType);
+    res.send(await registry.metrics());
+  });
 
   app.get("/health", async (_req, res) => {
     try {
@@ -196,6 +299,20 @@ function createApp(pool) {
     } catch (err) {
       res.status(503).json({ status: "unavailable", service: "payments", error: err.message });
     }
+  });
+
+  // ---- Area D fault switches ----------------------------------------------------------------
+  app.get("/internal/faults", requireInternalKey, (_req, res) => {
+    res.json(faults.snapshot());
+  });
+
+  app.post("/internal/faults", requireInternalKey, (req, res) => {
+    const parsed = faultCommand.safeParse(req.body);
+    if (!parsed.success) {
+      return res.status(400).json({ error: "invalid fault command", details: parsed.error.flatten() });
+    }
+    if (parsed.data.reset) return res.json(faults.reset());
+    return res.json(faults.set(parsed.data));
   });
 
   // ---- public read side (JWT verified by this service) --------------------------------------
@@ -225,8 +342,10 @@ function createApp(pool) {
     if (!parsed.success) {
       return res.status(400).json({ error: "invalid webhook payload", details: parsed.error.flatten() });
     }
-    const result = await settleWebhook(parsed.data);
-    return res.status(200).json({ received: true, ...result });
+    return respondIdempotent(req, res, "payments-webhook", async () => {
+      const result = await settleWebhook(parsed.data);
+      return { status: 200, body: { received: true, ...result } };
+    });
   });
 
   // ---- internal write side (monolith only) --------------------------------------------------
@@ -235,12 +354,14 @@ function createApp(pool) {
     if (!parsed.success) {
       return res.status(400).json({ error: "invalid intent command", details: parsed.error.flatten() });
     }
-    const intent = await db.ensureIntent({
-      orderId: parsed.data.order_id,
-      amountCents: parsed.data.amount_cents,
-      gatewayRef: parsed.data.gateway_ref,
+    return respondIdempotent(req, res, "payment-intents", async () => {
+      const intent = await db.ensureIntent({
+        orderId: parsed.data.order_id,
+        amountCents: parsed.data.amount_cents,
+        gatewayRef: parsed.data.gateway_ref,
+      });
+      return { status: 201, body: { intent: toIntent(intent) } };
     });
-    res.status(201).json({ intent: toIntent(intent) });
   });
 
   app.get("/internal/payment-intents/by-order/:orderId", requireInternalKey, async (req, res) => {
@@ -256,8 +377,10 @@ function createApp(pool) {
     if (!parsed.success) {
       return res.status(400).json({ error: "invalid wallet command", details: parsed.error.flatten() });
     }
-    await db.createWallet(parsed.data.provider_id);
-    res.status(201).json({ created: true, provider_id: parsed.data.provider_id });
+    return respondIdempotent(req, res, "wallets", async () => {
+      await db.createWallet(parsed.data.provider_id);
+      return { status: 201, body: { created: true, provider_id: parsed.data.provider_id } };
+    });
   });
 
   app.delete("/internal/wallets/:providerId", requireInternalKey, async (req, res) => {
@@ -294,35 +417,37 @@ function createApp(pool) {
     const kind = gateway ? "payout_credit" : "commission_owed";
     const amount = gateway ? c.earnings_cents : c.commission_cents;
 
-    const client = await pool.connect();
-    try {
-      await client.query("BEGIN");
-      const inserted = await db.insertLedgerEntry(
-        {
-          orderId: c.order_id,
-          customerId: c.customer_id ?? null,
-          providerId: c.provider_id ?? null,
-          kind,
-          amountCents: amount,
-          method: c.payment_method,
-        },
-        client
-      );
-      if (inserted && c.provider_id) {
-        await db.applyWalletDelta(
-          c.provider_id,
-          gateway ? { balanceDelta: amount } : { commissionDelta: amount },
+    return respondIdempotent(req, res, "ledger-booking-completed", async () => {
+      const client = await pool.connect();
+      try {
+        await client.query("BEGIN");
+        const inserted = await db.insertLedgerEntry(
+          {
+            orderId: c.order_id,
+            customerId: c.customer_id ?? null,
+            providerId: c.provider_id ?? null,
+            kind,
+            amountCents: amount,
+            method: c.payment_method,
+          },
           client
         );
+        if (inserted && c.provider_id) {
+          await db.applyWalletDelta(
+            c.provider_id,
+            gateway ? { balanceDelta: amount } : { commissionDelta: amount },
+            client
+          );
+        }
+        await client.query("COMMIT");
+        return { status: 200, body: { applied: inserted, kind, amount_cents: amount } };
+      } catch (err) {
+        await client.query("ROLLBACK");
+        throw err;
+      } finally {
+        client.release();
       }
-      await client.query("COMMIT");
-      res.json({ applied: inserted, kind, amount_cents: amount });
-    } catch (err) {
-      await client.query("ROLLBACK");
-      throw err;
-    } finally {
-      client.release();
-    }
+    });
   });
 
   app.post("/internal/ledger/booking-cancelled", requireInternalKey, async (req, res) => {
@@ -331,16 +456,18 @@ function createApp(pool) {
       return res.status(400).json({ error: "invalid cancellation command", details: parsed.error.flatten() });
     }
     const c = parsed.data;
-    const inserted = await db.insertLedgerEntry({
-      orderId: c.order_id,
-      customerId: c.customer_id ?? null,
-      providerId: c.provider_id ?? null,
-      kind: "refund",
-      amountCents: c.total_cents,
-      method: "gateway",
-      status: "refunded",
+    return respondIdempotent(req, res, "ledger-booking-cancelled", async () => {
+      const inserted = await db.insertLedgerEntry({
+        orderId: c.order_id,
+        customerId: c.customer_id ?? null,
+        providerId: c.provider_id ?? null,
+        kind: "refund",
+        amountCents: c.total_cents,
+        method: "gateway",
+        status: "refunded",
+      });
+      return { status: 200, body: { applied: inserted, kind: "refund", amount_cents: c.total_cents } };
     });
-    res.json({ applied: inserted, kind: "refund", amount_cents: c.total_cents });
   });
 
   // The monolith has already checked that the caller owns the booking; this only settles it.
@@ -349,14 +476,16 @@ function createApp(pool) {
     if (!parsed.success) {
       return res.status(400).json({ error: "invalid simulate command", details: parsed.error.flatten() });
     }
-    const intent = await db.findIntentByOrder(parsed.data.order_id);
-    if (!intent) throw httpError(409, "this booking has no gateway payment to settle");
-    const result = await settleWebhook({
-      gateway_event_id: `SIM-EVT-${crypto.randomUUID()}`,
-      type: "payment_intent.succeeded",
-      gateway_ref: intent.gateway_ref,
+    return respondIdempotent(req, res, "simulate", async () => {
+      const intent = await db.findIntentByOrder(parsed.data.order_id);
+      if (!intent) throw httpError(409, "this booking has no gateway payment to settle");
+      const result = await settleWebhook({
+        gateway_event_id: `SIM-EVT-${crypto.randomUUID()}`,
+        type: "payment_intent.succeeded",
+        gateway_ref: intent.gateway_ref,
+      });
+      return { status: 200, body: { ok: true, ...result } };
     });
-    res.json({ ok: true, ...result });
   });
 
   app.use((req, res) => {

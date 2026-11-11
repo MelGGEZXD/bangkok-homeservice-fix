@@ -57,6 +57,13 @@ services:
       # Area A, second extraction: wallet/ledger calls cross this seam.
       PAYMENTS_SERVICE_URL: http://payments:3002
       PAYMENTS_TIMEOUT_MS: "3000"
+      # Area D: three attempts, exponential backoff with full jitter.
+      PAYMENTS_MAX_ATTEMPTS: "3"
+      PAYMENTS_RETRY_BASE_MS: "250"
+      PAYMENTS_RETRY_MAX_MS: "4000"
+      # Area E: one trace across the HTTP and RabbitMQ seams.
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4318
+      OTEL_SERVICE_NAME: edemand
       WEBHOOK_SECRET: ${WEBHOOK_SECRET:-edemand-webhook-secret}
       # Area C: the only path for domain events across the boundary.
       RABBITMQ_URL: amqp://${RABBITMQ_USER:-edemand}:${RABBITMQ_PASSWORD:-edemand-demo-pass}@rabbitmq:5672
@@ -135,6 +142,9 @@ services:
       RABBITMQ_URL: amqp://${RABBITMQ_USER:-edemand}:${RABBITMQ_PASSWORD:-edemand-demo-pass}@rabbitmq:5672
       RABBITMQ_EXCHANGE: edemand.events
       NOTIFICATIONS_QUEUE: edemand.notifications
+      # Area E: continue the traceparent carried on each RabbitMQ message.
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4318
+      OTEL_SERVICE_NAME: notifications
     depends_on:
       notifications-db:
         condition: service_healthy
@@ -186,6 +196,9 @@ services:
       # After money commits, tell the order owner (the monolith) over an internal idempotent call.
       BOOKING_SERVICE_URL: http://edemand:3000
       BOOKING_TIMEOUT_MS: "3000"
+      # Area E: continue the traceparent from the monolith and inject it on the way back.
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4318
+      OTEL_SERVICE_NAME: payments
     depends_on:
       payments-db:
         condition: service_healthy
@@ -221,7 +234,68 @@ services:
       retries: 12
       start_period: 10s
 
+  # ---- Area E: observability ----------------------------------------------------------------
+  # Jaeger all-in-one receives OTLP/HTTP on 4318 and serves the trace UI on 16686. A demo opens
+  # the UI, pastes the x-trace-id from a response header (or clicks the Jaeger link printed by
+  # scripts/beat4-find-the-trace.sh) and sees one trace spanning all three services.
+  jaeger:
+    image: jaegertracing/all-in-one:1.62.0
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    ports:
+      - "16686:16686"
+      - "4318:4318"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:16686/"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+
+  # Prometheus scrapes each service's /metrics over the compose network. nginx does not route
+  # /metrics, so the endpoint is internal even though every service exposes it.
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.retention.time=6h"
+    volumes:
+      - ./observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "9090:9090"
+    depends_on:
+      edemand:
+        condition: service_healthy
+      notifications:
+        condition: service_healthy
+      payments:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:9090/-/healthy"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+
+  # Grafana is pre-provisioned: the Prometheus datasource and the "services at a glance"
+  # dashboard are loaded from disk, so a clean boot needs no clicking. Anonymous admin is fine
+  # for a local demo; this is not the product's auth boundary.
+  grafana:
+    image: grafana/grafana:11.2.2
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+      GF_AUTH_DISABLE_LOGIN_FORM: "true"
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "3005:3000"
+    depends_on:
+      - prometheus
+
 volumes:
   notifications-db-data:
   payments-db-data:
   rabbitmq-data:
+  grafana-data:

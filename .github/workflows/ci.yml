@@ -1,0 +1,57 @@
+# Area E CI: unit/concurrency/saga tests, the two Pact consumer contracts, and a production build.
+#
+# The Pact step is the one the brief asks to be runnable locally with `act`:
+#   act pull_request -j contracts
+# It needs no Docker socket inside the job; the Pact mock provider runs in-process and writes the
+# pact files to ./pacts, which are uploaded as the job artifact.
+name: ci
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: unit and integration tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+      - run: npm ci
+      - run: npm run test:unit
+
+  contracts:
+    name: Pact consumer contracts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+      - run: npm ci
+      - run: npm run test:pact
+      - uses: actions/upload-artifact@v4
+        # act does not provide the artifact service, so the upload step is skipped when running
+        # locally (`ACT=true`) and runs normally on GitHub-hosted runners.
+        if: ${{ env.ACT != 'true' }}
+        with:
+          name: pacts
+          path: pacts/
+          if-no-files-found: error
+
+  build:
+    name: production build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+      - run: npm ci
+      - run: npm run build

@@ -16,6 +16,15 @@ const config = require("./config");
 const { insertNotification } = require("./db");
 const { project } = require("./notification-rules.cjs");
 const faults = require("./faults");
+const {
+  getTracer,
+  extractTraceparent,
+  traceparentFromActive,
+  context,
+  trace,
+  SpanKind,
+} = require("./telemetry");
+const { observeProjection } = require("./metrics");
 
 // Every event type this context knows how to project. Bind explicitly instead of "#": a future
 // event without a rule must not silently enter the notifications queue.
@@ -79,6 +88,9 @@ async function publishOutcome(type, payload) {
     aggregate_id: payload.saga_id,
     payload,
     occurred_at: new Date().toISOString(),
+    // Area E: the consumer span is the parent of the outcome message, so the orchestrator's
+    // handling of notification.created appears under the same trace as the original approval.
+    trace_parent: traceparentFromActive(),
   };
   await new Promise((resolve, reject) => {
     channel.publish(
@@ -92,6 +104,7 @@ async function publishOutcome(type, payload) {
         messageId: envelope.event_uid,
         type,
         timestamp: Date.now(),
+        headers: envelope.trace_parent ? { traceparent: envelope.trace_parent } : undefined,
       },
       (err) => (err ? reject(err) : resolve())
     );
@@ -148,8 +161,10 @@ async function handleMessage(msg) {
       created,
       duplicates,
     });
+    observeProjection(envelope.type, created > 0 ? "created" : "duplicate");
     consumerChannel.ack(msg);
   } catch (err) {
+    observeProjection(envelope.type, err.injected ? "injected_failure" : "failed");
     log("error", "event projection failed", {
       type: envelope.type,
       event_uid: envelope.event_uid,
@@ -204,12 +219,33 @@ async function connectOnce() {
 
   consumerTag = await channel.consume(config.rabbitmq.queue, (msg) => {
     if (!msg) return;
-    handleMessage(msg).catch((err) => {
-      log("error", "unhandled consumer error", { err: err.stack || err.message });
+    // Area E: continue the trace the relay started. The message header is the only link between
+    // the HTTP request that wrote the outbox row, minutes earlier, and this consumer.
+    const parent = extractTraceparent(msg.properties && msg.properties.headers);
+    const span = getTracer("notifications").startSpan(
+      `process ${(msg.properties && msg.properties.type) || "event"}`,
+      {
+        kind: SpanKind.CONSUMER,
+        attributes: {
+          "messaging.system": "rabbitmq",
+          "messaging.destination": config.rabbitmq.queue,
+          "messaging.message.id": msg.properties && msg.properties.messageId,
+        },
+      },
+      parent
+    );
+    context.with(trace.setSpan(context.active(), span), async () => {
       try {
-        consumerChannel.nack(msg, false, true);
-      } catch {
-        // channel already gone; broker will redeliver after reconnect
+        await handleMessage(msg);
+      } catch (err) {
+        log("error", "unhandled consumer error", { err: err.stack || err.message });
+        try {
+          consumerChannel.nack(msg, false, true);
+        } catch {
+          // channel already gone; broker will redeliver after reconnect
+        }
+      } finally {
+        span.end();
       }
     });
   });

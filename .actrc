@@ -1,0 +1,3 @@
+# Local GitHub Actions runner (Area E). The medium runner image has node/git/tar but is far
+# smaller than the 17 GB "large" image. Run: act pull_request -j contracts
+-P ubuntu-latest=catthehacker/ubuntu:act-22.04

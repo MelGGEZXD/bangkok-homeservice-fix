@@ -1,0 +1,24 @@
+# Prometheus scrape config (Area E).
+#
+# Each service exposes the same metric names with a `service` label, so one Grafana panel can
+# compare them. The monolith is scraped over the compose network; /metrics is never routed by
+# nginx, so it is not part of the public API surface.
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+scrape_configs:
+  - job_name: edemand
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["edemand:3000"]
+
+  - job_name: notifications
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["notifications:3001"]
+
+  - job_name: payments
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["payments:3002"]

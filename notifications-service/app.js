@@ -15,6 +15,8 @@ const { requireUser } = require("./auth");
 const config = require("./config");
 const { insertNotification } = require("./db");
 const faults = require("./faults");
+const { tracingMiddleware } = require("./telemetry");
+const { metricsMiddleware, registry } = require("./metrics");
 
 const notificationCommand = z.object({
   source_event_id: z.string().uuid(),
@@ -66,6 +68,16 @@ function createApp(pool) {
   });
 
   app.use(express.json({ limit: "64kb" }));
+
+  // Area E: one SERVER span per request, plus the same request/latency metrics as the other two
+  // services. /metrics itself is excluded from the rate panels by the Prometheus scrape config.
+  app.use(tracingMiddleware("notifications"));
+  app.use(metricsMiddleware("notifications"));
+
+  app.get("/metrics", async (_req, res) => {
+    res.setHeader("content-type", registry.contentType);
+    res.send(await registry.metrics());
+  });
 
   app.get("/health", async (_req, res) => {
     try {

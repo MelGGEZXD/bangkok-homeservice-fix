@@ -3,6 +3,10 @@
 // boot, and the outbox relay draining domain events in the background.
 export async function register() {
   if (process.env.NEXT_RUNTIME === "nodejs") {
+    // Area E: register the tracer provider before the first request can create a span.
+    const { startTelemetry } = await import("./lib/telemetry.js");
+    startTelemetry("edemand");
+
     const { bootstrapDb } = await import("./lib/db/bootstrap.js");
     bootstrapDb();
     // Area B: load the realm's signing keys before serving traffic, so the first authenticated
@@ -15,5 +19,8 @@ export async function register() {
     // (notification.created / notification.failed) from its own durable RabbitMQ queue.
     const { startSagaConsumer } = await import("./lib/modules/sagas/consumer.js");
     await startSagaConsumer();
+    // Area D: retry ledger commands the payments service did not acknowledge, with backoff.
+    const { startLedgerReconciler } = await import("./lib/modules/payments/ledger-queue.js");
+    startLedgerReconciler();
   }
 }

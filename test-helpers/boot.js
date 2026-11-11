@@ -6,7 +6,9 @@
 // place before any route handler's static graph (config, db) is evaluated. getDb() also resolves
 // the path at open time, so :memory: is guaranteed regardless of ESM import ordering.
 process.env.NODE_ENV = "test";
-process.env.DB_PATH = ":memory:";
+// Most test files want an isolated in-memory DB. The concurrency test overrides DB_PATH with a
+// file so two worker threads can open the SAME database and genuinely race.
+process.env.DB_PATH = process.env.DB_PATH || ":memory:";
 
 const { bootstrapDb } = await import("../lib/db/bootstrap.js");
 const { getDb, closeDb } = await import("../lib/db/index.js");
