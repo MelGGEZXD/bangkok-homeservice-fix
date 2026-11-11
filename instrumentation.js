@@ -11,5 +11,9 @@ export async function register() {
     await initKeycloak();
     const { startRelay } = await import("./lib/modules/notifications/relay.js");
     startRelay();
+    // Area C: the monolith orchestrates provider approval, so it also consumes the outcome events
+    // (notification.created / notification.failed) from its own durable RabbitMQ queue.
+    const { startSagaConsumer } = await import("./lib/modules/sagas/consumer.js");
+    await startSagaConsumer();
   }
 }

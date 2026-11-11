@@ -41,21 +41,24 @@ dependency, not part of the domain API surface.
 | `http://localhost:3000/api/notifications*` | Notifications service (`:3001`, own PostgreSQL DB) |
 | `http://localhost:3000/*` | Next.js monolith (`:3000`, internal only — no published port) |
 | `http://localhost:8081` | Keycloak (realm `edemand`; admin console for the demo) |
+| `http://localhost:15672` | RabbitMQ management console (`edemand` / `edemand-demo-pass`) |
 
 ```bash
-# Full stack: monolith + notifications service + its PostgreSQL DB + Keycloak + nginx gateway
+# Full stack: monolith + notifications service + PostgreSQL + Keycloak + RabbitMQ + nginx gateway
 docker compose up -d --build --wait      # http://localhost:3000
-docker compose run --rm test             # 63 tests, in-memory, no server needed
-docker compose down -v                   # also drops the notifications DB volume
+docker compose run --rm test             # 71 tests, in-memory, no server needed
+docker compose down -v                   # also drops the notifications + RabbitMQ volumes
 
-# App-only local dev (monolith on :3000). The notifications API/UI returns 502 until the extracted
-# service is running; `docker compose up -d notifications notifications-db` gives you one on :3001.
+# App-only local dev (monolith on :3000). The notifications API/UI returns 502 and the outbox does
+# not publish until the broker and service are running. Start them, then export RABBITMQ_URL:
+docker compose up -d rabbitmq notifications notifications-db
+export RABBITMQ_URL=amqp://edemand:edemand-demo-pass@localhost:5672
 npm install
 npm run dev
 # or: npm run build && npm start
 
-# Notifications service by itself (needs a PostgreSQL DATABASE_URL and KEYCLOAK_URL)
-cd notifications-service && npm install && DATABASE_URL=postgres://... KEYCLOAK_URL=... npm start
+# Notifications service by itself (needs a PostgreSQL DATABASE_URL, KEYCLOAK_URL and RABBITMQ_URL)
+cd notifications-service && npm install && DATABASE_URL=postgres://... KEYCLOAK_URL=... RABBITMQ_URL=... npm start
 ```
 
 Secrets are environment variables. The compose defaults are **demo-only**; override
@@ -90,7 +93,7 @@ tables through its own repository; it goes through the owning context's service/
 | 5 | **Bidding** | `job_requests`, `bids` | Custom jobs + provider bids; the bid-accept race that spins up a booking. |
 | 6 | **Payments & Wallet** | `payment_intents`, `transactions`, `provider_wallets`, `webhook_events` | Gateway intents, the idempotent webhook, the commission split. |
 | 7 | **Reviews** | `reviews` | One review per completed booking; emits `review.created`. |
-| 8 | **Notifications** | `notifications` in its **own PostgreSQL DB** (extracted) | Read side + ownership check in the service. The monolith's outbox relay still drains `events` and delivers commands across the boundary. |
+| 8 | **Notifications** | `notifications` in its **own PostgreSQL DB** (extracted) | Read side + ownership check in the service. Consumes domain events from RabbitMQ and owns the event → notification projection. |
 
 Shared infra (under `lib/db`, not a context): `events` (the outbox) and `idempotency_keys`.
 
@@ -102,10 +105,12 @@ lib/
   config.js logger.js errors.js
   http/              handle, respond, auth, validate, pagination, requestId, session
   db/                index, schema, migrate, seed, bootstrap, idempotency, events
+  messaging/         rabbit.js (connection + confirms), publisher.js (outbox -> broker)
   modules/<context>/ repository.js + service.js  (+ booking/slots.js, booking/availability.js,
                                                    payments/gateway.js, notifications/relay.js,
-                                                   notifications/client.js)
-notifications-service/  extracted Express service: server.js, app.js, db.js (PostgreSQL), auth.js
+                                                   notifications/client.js, sagas/*)
+notifications-service/  extracted Express service: server.js, app.js, db.js (PostgreSQL), auth.js,
+                        broker.js (RabbitMQ consumer), notification-rules.cjs, faults.js
 gateway/nginx.conf      the Area A gateway: /api/notifications -> service, everything else -> monolith
 test/ test-helpers/     node:test suite driving the real route handlers in-process
 ```
@@ -130,16 +135,17 @@ What makes the cut real rather than a stub:
 - **Same public addresses.** nginx publishes `:3000` and routes `/api/notifications*` to the service;
   the monolith keeps no host port. The UI page `/notifications` still lives at the same URL and
   fetches the service with the browser's httpOnly JWT.
-- **Idempotent delivery.** Every notification command carries `source_event_id`. The service has a
-  unique key on `(source_event_id, recipient_role, recipient_id, type)` and inserts with
-  `ON CONFLICT DO NOTHING`. The relay releases a failed event claim and retries — at-least-once
-  delivery, exactly-one effect.
+- **Idempotent delivery.** Every domain event carries the outbox UUID (`source_event_id`). The
+  service has a unique key on `(source_event_id, recipient_role, recipient_id, type)` and inserts
+  with `ON CONFLICT DO NOTHING`. The relay releases a failed publish claim and retries —
+  at-least-once delivery, exactly-one effect. Area C moves this hop onto RabbitMQ; the dedupe key
+  is unchanged.
 - **The service checks the token itself.** `notifications-service/auth.js` verifies the Keycloak
   RS256 token against the realm JWKS and derives the recipient from it, never from a query string.
   Mark-read also checks ownership (`403 not your notification`). See Area B below.
-- **Approval is still atomic.** `approveProvider` writes a `provider.approved` outbox event in the
-  same SQLite transaction as the flag flip; the relay delivers the notification afterwards. The
-  monolith never writes the moved table.
+- **Approval is still atomic.** `approveProvider` writes the flag flip, the `provider_approval`
+  saga row and the `provider.approved` outbox event in the same SQLite transaction; the relay
+  publishes afterwards. The monolith never writes the moved table.
 
 Proof from the running stack (`jq` for token extraction):
 
@@ -229,6 +235,91 @@ PASS  another user cannot mark Glow's notification read
 PASS  an unrelated customer cannot read the job (was 200 before the fix)
 ```
 
+### Area C — events on RabbitMQ, duplicate delivery, and a saga
+
+| The four boundary questions | Answer |
+|---|---|
+| **What crosses** | Domain **events**, not commands: `provider.approved`, `provider.approval_reverted`, `booking.status_changed`, `booking.completed`, `review.created`, `bid.accepted`, `payment.succeeded`. The message is the raw event (`event_uid`, `type`, `aggregate_*`, `payload`, `occurred_at`). |
+| **Ownership** | The monolith owns the outbox (`events`) and the saga table (`sagas`). The Notifications service owns the event → notification projection (`notification-rules.cjs`) and its PostgreSQL rows. |
+| **Transport** | RabbitMQ topic exchange `edemand.events`; durable queues `edemand.notifications` (consumer: Notifications) and `edemand.sagas` (consumer: the orchestrator). Publisher confirms; at-least-once delivery. |
+| **Decision** | Publish from the outbox in the same transaction as the state change, then let each consumer own its projection. Provider approval is the cross-service workflow, run as an **orchestrated saga**. |
+
+**Outbox, not dual writes.** `approveProvider`, every booking transition, `review.created`, bid
+acceptance and payment settlement insert their `events` row inside the same SQLite transaction as
+the state change. Either both commit or neither does. The in-process relay (`setInterval` in
+`instrumentation.js`) claims a row, publishes it to `edemand.events`, and only then stamps
+`processed_at`. If the broker is down the claim is released and the next pass retries. This is the
+transactional-outbox pattern, not “write the DB then publish and hope”.
+
+**Duplicate delivery still has one effect.** Delivery is at-least-once by design: a broker can
+redeliver after a crash, and the relay can republish after a failed confirm. The Notifications
+service inserts with a unique key `(source_event_id, recipient_role, recipient_id, type)` and
+`ON CONFLICT DO NOTHING`, where `source_event_id` is the outbox UUID. A duplicate message therefore
+creates **no second row**. The saga outcomes use the same trick: `notification.created` /
+`notification.failed` are handled by conditional `UPDATE ... WHERE state='awaiting_notification'`,
+so a duplicate outcome cannot finish or compensate a saga twice.
+
+**Two events are demonstrated.** `provider.approved` is the event that drives the saga below.
+`booking.status_changed` is the ordinary event path: placing a booking writes it, the relay publishes
+it, and the projection notifies the counterparty. Both are proven on the live stack and in
+`test/area-c-events.test.js`.
+
+**The saga: provider approval.** Approving a provider has a local step (set `is_approved`) and a
+remote step (create the welcome notification in another service/database). The sequence is:
+
+1. **local** — in one SQLite transaction: flip `is_approved`, insert the `sagas` row
+   (`awaiting_notification`), insert `provider.approved` with its `saga_id` in the payload;
+2. **remote** — Notifications consumes the event, writes the notification idempotently, and
+   publishes `notification.created` (or `notification.failed`);
+3. **local** — the orchestrator consumes the outcome: `notification.created` moves the saga to
+   `completed`; `notification.failed` runs the **compensating action**, which unapproves the provider
+   and writes `provider.approval_reverted` in the same transaction as `state='compensated'`.
+
+The admin can follow the workflow at `GET /api/admin/sagas/{id}` (and list it at
+`GET /api/admin/sagas`). A failed approval can be retried; a retry is a fresh saga.
+
+**Why orchestration, not choreography.** The approval is one admin action with a clear owner, a
+short fixed sequence (two steps), and exactly one compensating action. Putting that sequence in one
+place makes it easy to read, test and operate: the monolith can answer “what happened to this
+approval?” from one `sagas` row, and the remote participant stays dumb — it only reports whether the
+notification was created. Choreography would spread the sequence across Notifications (which would
+have to know that its failure means “unapprove”) and make ownership of the compensation ambiguous.
+Choreography is the better fit for long, loosely-coupled, many-consumer flows; a two-step onboarding
+with one owner is not that.
+
+**Deterministic failure demo.** `POST /internal/faults` on the Notifications service (shared internal
+key, never routed through the gateway) turns on `notification_failure`. The consumer then publishes
+`notification.failed` instead of writing a row, which triggers the real compensation. The switch is
+in-memory and resets on restart.
+
+```bash
+bash scripts/verify-area-c.sh
+```
+
+Expected (after `docker compose up -d --build --wait`):
+
+```
+PASS  notifications queue exists on RabbitMQ
+PASS  Notifications service is consuming edemand.notifications (1 consumer)
+PASS  topic exchange exists
+PASS  approval returned saga <uuid>
+PASS  saga <uuid> completed after notification.created
+PASS  the relay published event <uuid> to RabbitMQ (outbox row processed)
+PASS  re-publishing the same event created no second notification
+PASS  PostgreSQL holds exactly one row for source_event_id <uuid>
+PASS  booking.status_changed was published from the outbox
+PASS  FixIt received exactly one booking_status notification for order ...
+PASS  notification.failed compensated saga <uuid>
+PASS  compensating action unapproved Glow
+PASS  Glow received provider_approval_reverted
+PASS  retry completed the saga and Glow is approved again
+AREA C PASSED (18 assertions)
+```
+
+**Reset.** `docker compose down -v` drops both the notifications PostgreSQL volume and the RabbitMQ
+volume. RabbitMQ also recreates the exchange/queues from the assert-on-boot code, so the topology is
+deterministic. The broker is not a second source of truth: the outbox is.
+
 ---
 
 ## Seam analysis — what extracts first, and why
@@ -238,9 +329,9 @@ cross-context calls to replace with network calls. Ranked by *how cleanly it det
 
 1. **Notifications (extract first — done in Area A).** It already behaved like a separate service:
    one owned table, no synchronous hot-path caller. It now runs as an Express service with its own
-   PostgreSQL DB behind the gateway. The remaining monolith coupling is the **publisher** — the
-   in-process relay still drains `events` and calls the service. Area C replaces that hop with
-   RabbitMQ; the service's `source_event_id` dedupe already assumes at-least-once delivery.
+   PostgreSQL DB behind the gateway. **Area C closed the remaining coupling**: the relay publishes
+   raw domain events to RabbitMQ, and the service owns the event → notification projection. The
+   service's `source_event_id` dedupe still assumes at-least-once delivery.
    Lowest-risk, highest-teaching-value first cut.
 2. **Payments & Wallet (extract second).** The webhook is already an async, idempotent,
    secret-authenticated boundary — exactly what a payments service exposes. Its one inward coupling is
@@ -285,9 +376,12 @@ Each is a genuine mechanism, not a stub, and each has a test proving it.
   `gateway_event_id` is the dedupe key (`webhook_events.gateway_event_id UNIQUE`). A replayed callback
   short-circuits and credits nothing twice. (Contrast: the real product has no idempotency and
   double-processes retries.)
-- **Outbox + relay** (`db/events.js`, `notifications/relay.js`). Every state change writes an `events`
-  row **in the same transaction**. A relay drains it (`setInterval` in `instrumentation.js`, or
-  `runRelayOnce()` in tests), claiming each event via `processed_at` so it applies **exactly once**.
+- **Outbox + relay + broker** (`db/events.js`, `notifications/relay.js`, `lib/messaging/rabbit.js`).
+  Every state change writes an `events` row **in the same transaction**. A relay drains it
+  (`setInterval` in `instrumentation.js`, or `runRelayOnce()` in tests), claiming each event via
+  `processed_at` and publishing it to RabbitMQ with publisher confirms. Consumers dedupe on the
+  outbox UUID, so a redelivery has exactly one effect. The live proof is
+  `scripts/verify-area-c.sh`.
 - **Eventual consistency of ratings.** The service/provider rating aggregate is recomputed **in the
   relay**, driven by `review.created` — *not inline* in the review handler. So a fresh review leaves
   the aggregate momentarily stale until the relay runs. This is the deliberate contrast with Ride
@@ -304,8 +398,14 @@ Each is a genuine mechanism, not a stub, and each has a test proving it.
   (Payments writes `orders.payment_status`; the relay writes `services.rating_avg`). Cheap and atomic
   now; each one becomes a network call + a consistency decision after extraction.
 - **The relay is in-process.** `setInterval(runRelayOnce, 1000)` shares the connection and dies with
-  the process. Real deployments need a durable broker + at-least-once delivery + a dead-letter path.
-  The `events` table + `processed_at` claim is the seam that makes swapping it in mechanical.
+  the process. The broker makes delivery durable across service restarts, but the *publisher* is
+  still the monolith's own timer (a relay container, Debezium/CDC, or a transactional queue would
+  be the next step). The `events` table + `processed_at` claim is the seam that makes that swap
+  mechanical.
+- **Sagas are single-orchestrator.** `sagas` lives in the monolith's SQLite file and the orchestrator
+  is the monolith. That is the right amount of process for one two-step workflow; a second
+  orchestrator instance would need a lease/claim on `sagas` rows (the conditional UPDATEs already
+  make duplicate *messages* safe, but not duplicate pollers).
 - **Shared deploy + blast radius.** A migration, a slow query, or a crash in any context stops all of
   them. There is no independent scaling: the read-heavy Catalog scales with the write-heavy Booking.
   (Notifications is now the exception: it has its own deploy and DB, and a notifications outage no
@@ -318,19 +418,28 @@ Each is a genuine mechanism, not a stub, and each has a test proving it.
   realm is imported from a committed JSON file, and the demo uses a published hostname
   (`localhost:8081`) rather than a production ingress with TLS.
 
-Out of scope by design (course adds later): broker/saga, fault injection, tracing/metrics, real
-payment gateways, chat, cart, subscriptions. `SOAP`/`WSDL` appear nowhere.
+Out of scope by design (course adds later): fault injection at the HTTP edge, distributed tracing,
+real metrics dashboards, contract tests in CI, real payment gateways, chat, cart, subscriptions.
+`SOAP`/`WSDL` appear nowhere.
 
 ---
 
 ## Tests
 
 `node --test`, no socket — the suite imports the real App Router route handlers and drives them
-in-process against per-file in-memory databases. 63 tests across:
+in-process against per-file in-memory databases. 71 tests across:
 
 `health` · `identity` (auth, 401/403/400/409) · `catalog` (pagination, ownership) · `booking`
 (id 8001, the slot double-book race, idempotency, the full status machine, OTP-gated complete +
 exactly-once credit, cancel/refund, reschedule) · `slots` · `bidding` (accept race, accept-vs-withdraw)
 · `payments-webhook` (replay = single credit) · `reviews-outbox` (stale-then-relay-recomputed,
 relay idempotent, exactly one notification delivered across the boundary) · `admin` (approval writes
-`provider.approved` atomically, the monolith owns no notifications table, relay delivers once).
+`provider.approved` atomically, the monolith owns no notifications table, relay delivers once) ·
+`area-c-events` (outbox + publisher, duplicate delivery has one effect, `notification.created`
+completes the saga, `booking.status_changed` as a second event, `notification.failed` compensates by
+unapproving the provider, retry succeeds).
+
+The broker itself is not started by `node:test`; `test-helpers/notifications.js` installs an
+in-process publisher that runs the **same** projection rules as the service
+(`notifications-service/notification-rules.cjs`). RabbitMQ, real queues and duplicate redelivery are
+proven by `scripts/verify-area-c.sh` on the compose stack.

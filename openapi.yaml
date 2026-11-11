@@ -200,9 +200,9 @@ paths:
   /api/admin/providers/{id}/approve:
     post:
       tags: [Admin]
-      summary: 'Approve a provider (A) -> notifies the provider'
+      summary: 'Approve a provider (A) -> starts the provider_approval saga (Area C)'
       parameters: [ { name: id, in: path, required: true, schema: { type: integer } } ]
-      responses: { '200': { description: ok }, '403': { description: not admin } }
+      responses: { '200': { description: 'ok; body includes saga_id' }, '403': { description: not admin }, '409': { description: already approved } }
   /api/admin/providers/{id}/commission:
     patch:
       tags: [Admin]
@@ -211,6 +211,14 @@ paths:
       responses: { '200': { description: ok } }
   /api/admin/bookings:
     get: { tags: [Admin], summary: 'All bookings (A), paginated', responses: { '200': { description: ok } } }
+  /api/admin/sagas:
+    get: { tags: [Admin], summary: 'Cross-service sagas (A), newest first (Area C)', responses: { '200': { description: ok } } }
+  /api/admin/sagas/{id}:
+    get:
+      tags: [Admin]
+      summary: 'One saga: state, attempts, last_error (A) (Area C)'
+      parameters: [ { name: id, in: path, required: true, schema: { type: string, format: uuid } } ]
+      responses: { '200': { description: 'state = awaiting_notification | completed | compensated | failed' }, '404': { description: missing } }
 
   /api/bookings:
     post:

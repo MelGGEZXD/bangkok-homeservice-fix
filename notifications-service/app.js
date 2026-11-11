@@ -4,13 +4,17 @@
 //   GET  /api/notifications            -> the caller's inbox (JWT required)
 //   POST /api/notifications/:id/read   -> mark own notification read (JWT required)
 //
-// Internal write side (monolith relay only, shared key):
-//   POST /internal/notifications       -> idempotent create from an outbox event
+// Internal write side (monolith relay / operator only, shared key):
+//   POST /internal/notifications       -> idempotent create from a notification command
+//   GET  /internal/faults              -> current demo fault switches (Area C)
+//   POST /internal/faults              -> turn the injected notification failure on/off
 const express = require("express");
 const crypto = require("node:crypto");
 const { z } = require("zod");
 const { requireUser } = require("./auth");
 const config = require("./config");
+const { insertNotification } = require("./db");
+const faults = require("./faults");
 
 const notificationCommand = z.object({
   source_event_id: z.string().uuid(),
@@ -111,21 +115,22 @@ function createApp(pool) {
     if (!parsed.success) {
       return res.status(400).json({ error: "invalid notification command", details: parsed.error.flatten() });
     }
-    const n = parsed.data;
 
-    const { rows } = await pool.query(
-      `INSERT INTO notifications
-         (source_event_id, recipient_role, recipient_id, type, title, body, order_id)
-       VALUES ($1, $2, $3, $4, $5, $6, $7)
-       ON CONFLICT (source_event_id, recipient_role, recipient_id, type) DO NOTHING
-       RETURNING *`,
-      [n.source_event_id, n.recipient_role, n.recipient_id, n.type, n.title, n.body, n.order_id ?? null]
-    );
-
-    if (rows.length === 0) {
+    const result = await insertNotification(parsed.data);
+    if (result.duplicate) {
       return res.status(200).json({ duplicate: true });
     }
-    return res.status(201).json({ duplicate: false, notification: toPublic(rows[0]) });
+    return res.status(201).json({ duplicate: false, notification: toPublic(result.notification) });
+  });
+
+  // Area C demo switch. Kept behind the internal key: it exists to prove the compensating action,
+  // not as a product feature.
+  app.get("/internal/faults", requireInternalKey, (_req, res) => {
+    res.json(faults.getFaults());
+  });
+
+  app.post("/internal/faults", requireInternalKey, (req, res) => {
+    res.json(faults.setFaults(req.body || {}));
   });
 
   app.use((req, res) => {

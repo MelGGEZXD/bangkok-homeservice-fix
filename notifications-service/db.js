@@ -45,6 +45,31 @@ async function initDb() {
   );
 }
 
+// One idempotent write used by BOTH ingest paths (the internal HTTP command endpoint and the Area C
+// RabbitMQ consumer). The unique key is the whole exactly-once proof: re-delivering the same event
+// returns `{duplicate: true, notification: null}` and writes no second row.
+async function insertNotification(notification) {
+  const { rows } = await getPool().query(
+    `INSERT INTO notifications
+       (source_event_id, recipient_role, recipient_id, type, title, body, order_id)
+     VALUES ($1, $2, $3, $4, $5, $6, $7)
+     ON CONFLICT (source_event_id, recipient_role, recipient_id, type) DO NOTHING
+     RETURNING *`,
+    [
+      notification.source_event_id,
+      notification.recipient_role,
+      notification.recipient_id,
+      notification.type,
+      notification.title,
+      notification.body,
+      notification.order_id ?? null,
+    ]
+  );
+  return rows.length === 0
+    ? { duplicate: true, notification: null }
+    : { duplicate: false, notification: rows[0] };
+}
+
 async function closeDb() {
   if (pool) {
     await pool.end();
@@ -52,4 +77,4 @@ async function closeDb() {
   }
 }
 
-module.exports = { getPool, initDb, closeDb };
+module.exports = { getPool, initDb, insertNotification, closeDb };

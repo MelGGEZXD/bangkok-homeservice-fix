@@ -25,4 +25,13 @@ module.exports = {
     issuer: process.env.KEYCLOAK_ISSUER || `${keycloakUrl}/realms/${keycloakRealm}`,
     audience: process.env.KEYCLOAK_AUDIENCE || "edemand-api",
   },
+  // Area C: this service consumes domain events from RabbitMQ and publishes saga outcomes back.
+  // Without RABBITMQ_URL the HTTP ingest endpoint still works, so the service stays runnable alone.
+  rabbitmq: {
+    enabled: Boolean(process.env.RABBITMQ_URL),
+    url: process.env.RABBITMQ_URL || "amqp://edemand:edemand-demo-pass@localhost:5672",
+    exchange: process.env.RABBITMQ_EXCHANGE || "edemand.events",
+    queue: process.env.NOTIFICATIONS_QUEUE || "edemand.notifications",
+    prefetch: int(process.env.RABBITMQ_PREFETCH, 20),
+  },
 };
