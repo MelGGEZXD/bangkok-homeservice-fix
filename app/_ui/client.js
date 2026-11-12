@@ -150,6 +150,9 @@ export function BookingForm({ serviceId, providerId, duration, addresses }) {
     return (
       <div className="panel stack">
         <div className="notice">Booking <strong>#{result.order.id}</strong> placed — status <em>{result.order.status}</em>.</div>
+        {result.payment_setup === "pending" ? (
+          <p>Payment setup is still in progress. Open the booking to check its status.</p>
+        ) : null}
         <div>
           <div className="small muted">Read this OTP to your provider at completion:</div>
           <div className="otp">{result.otp}</div>

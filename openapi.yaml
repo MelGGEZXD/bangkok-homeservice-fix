@@ -73,6 +73,7 @@ components:
       properties:
         order: { $ref: '#/components/schemas/Order' }
         otp: { type: integer, example: 428193 }
+        payment_setup: { type: string, enum: [pending] }
         payment_intent:
           type: object
           nullable: true
@@ -233,7 +234,8 @@ paths:
                 payment_method: { type: string, enum: [cod, gateway] }
       responses:
         '201': { description: created, content: { application/json: { schema: { $ref: '#/components/schemas/PlaceBookingResult' } } } }
-        '409': { description: 'slot no longer available', content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '202': { description: 'booking held while the payment setup outcome is pending; check booking detail', content: { application/json: { schema: { $ref: '#/components/schemas/PlaceBookingResult' } } } }
+        '409': { description: 'slot unavailable or payment setup rejected and slots released', content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
     get:
       tags: [Booking]
       summary: 'My bookings (C or P), paginated, ?status'

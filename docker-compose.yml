@@ -40,6 +40,8 @@ services:
     build:
       context: .
       target: runtime
+    volumes:
+      - edemand-data:/app/data
     # No host port: the monolith is reachable only through the gateway now.
     expose:
       - "3000"
@@ -48,6 +50,8 @@ services:
       # started. Its own /api/health stays red until the keys are loaded, so the gateway waits.
       keycloak:
         condition: service_started
+      payments:
+        condition: service_healthy
     environment:
       NODE_ENV: production
       # Area B: Keycloak is the only token issuer. JWT_SECRET is retained for the node:test suite
@@ -64,6 +68,9 @@ services:
       NOTIFICATIONS_SERVICE_URL: http://notifications:3001
       RABBITMQ_URL: "amqp://homeservice:area-c-demo@rabbitmq:5672"
       NOTIFICATIONS_TIMEOUT_MS: "3000"
+      PAYMENTS_SERVICE_URL: http://payments:3002
+      PAYMENTS_CLIENT_SECRET: ${PAYMENTS_CLIENT_SECRET:-dev-edemand-worker-change-me}
+      PAYMENTS_TIMEOUT_MS: ${PAYMENTS_TIMEOUT_MS:-2500}
     healthcheck:
       test: ["CMD", "node", "-e", "require('http').get('http://127.0.0.1:3000/api/health',r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1))"]
       interval: 10s
@@ -99,6 +106,7 @@ services:
     ports:
       - "8081:8080"
     volumes:
+      - keycloak-data:/opt/keycloak/data
       - ./keycloak/realm-edemand.json:/opt/keycloak/data/import/realm-edemand.json:ro
 
   notifications-db:
@@ -148,6 +156,45 @@ services:
       start_period: 60s
       retries: 6
 
+  payments-db:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_USER: payments
+      POSTGRES_PASSWORD: ${PAYMENTS_DB_PASSWORD:-dev-payments-password}
+      POSTGRES_DB: payments
+    volumes:
+      - payments-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "payments", "-d", "payments"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  payments:
+    build: ./payments-service
+    environment:
+      PAYMENTS_DB_HOST: payments-db
+      PAYMENTS_DB_NAME: payments
+      PAYMENTS_DB_USER: payments
+      PAYMENTS_DB_PASSWORD: ${PAYMENTS_DB_PASSWORD:-dev-payments-password}
+      KEYCLOAK_URL: http://keycloak:8080
+      KEYCLOAK_REALM: edemand
+      KEYCLOAK_ISSUER: http://localhost:8081/realms/edemand
+      KEYCLOAK_AUDIENCE: edemand-api
+      PAYMENTS_DEMO_REJECT_INTENTS: ${PAYMENTS_DEMO_REJECT_INTENTS:-false}
+      PAYMENTS_DEMO_DELAY_FIRST_REPLY: ${PAYMENTS_DEMO_DELAY_FIRST_REPLY:-false}
+    depends_on:
+      payments-db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "from urllib.request import urlopen; urlopen('http://127.0.0.1:3002/health', timeout=2).close()"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
 volumes:
   notifications-db-data:
   rabbitmq-data:
+  payments-db-data:
+  edemand-data:
+  keycloak-data:

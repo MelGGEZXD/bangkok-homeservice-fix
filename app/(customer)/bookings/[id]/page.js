@@ -18,7 +18,7 @@ export default function BookingDetailPage({ params }) {
     redirect("/");
   }
 
-  const canCancel = session.role === "customer" && ["awaiting", "confirmed"].includes(b.status);
+  const canCancel = session.role === "customer" && b.payment_setup !== "pending" && ["awaiting", "confirmed"].includes(b.status);
   const canReview = session.role === "customer" && b.status === "completed";
 
   return (
@@ -67,6 +67,11 @@ export default function BookingDetailPage({ params }) {
       ) : null}
 
       <div className="row" style={{ marginTop: 16 }}>
+        {b.payment_setup === "pending" ? <p>Payment setup is still in progress. Refresh to check its status.</p> : null}
+        {session.role === "customer" && b.payment_setup === "ready"
+          && b.payment_status === "pending" && b.status !== "cancelled" ? (
+            <ActionButton url="/api/payments/simulate" body={{ order_id: b.id }} label="Pay now (simulate)" />
+          ) : null}
         {canCancel ? (
           <ActionButton url={`/api/bookings/${b.id}/cancel`} label="Cancel booking" className="danger" confirm="Cancel this booking?" />
         ) : null}

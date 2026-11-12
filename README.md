@@ -19,12 +19,12 @@ toward microservices. The bounded-context boundaries below **are** the future se
 
 - **The monolith is one deployable.** Next.js 14 App Router. UI pages are Server Components that
   call the service layer **directly, in-process** (the honest monolith read path). Mutations POST to
-  **route handlers** under `app/api/**`. The same code, one `node server.js`. Area A adds exactly
-  one extracted service beside it (Notifications) behind the gateway.
+  **route handlers** under `app/api/**`. Notifications and Payments & Wallet have their own
+  services and PostgreSQL databases. Booking uses the Payments API for financial operations.
 - **The monolith owns one database.** `better-sqlite3`, one file `data/edemand.db` (`:memory:`
-  under test). WAL, `foreign_keys=ON`. Dropped, migrated and **reseeded on every boot** — a fresh
-  `docker compose up` is always identical. `sqlite_sequence` for `orders` is primed to 8000, so the
-  **first booking on a fresh boot is always id 8001**. The extracted notifications service owns a
+  under test). WAL, `foreign_keys=ON`. Compose keeps the file across ordinary restarts and seeds
+  an empty database. `sqlite_sequence` for `orders` is primed to 8000, so the
+  **first booking on a fresh database is id 8001**. The extracted notifications service owns a
   **separate PostgreSQL database**; the monolith has no `notifications` table at all.
 - **Layered.** `route handler → service → repository → db`. No SQL outside repositories; no business
   logic in route files. Every route is zod-validated, typed-error-mapped, JWT+role-gated where
@@ -32,21 +32,22 @@ toward microservices. The bounded-context boundaries below **are** the future se
 
 ### Run it
 
-**Areas A and B are in place:** the public entry point is the **nginx gateway on `:3000`**, and it
+The public entry point is the **nginx gateway on `:3000`**, and it
 keeps the addresses the app already had. Keycloak is the only token issuer; it is an identity
 dependency, not part of the domain API surface.
 
 | Public URL | Routed to |
 |---|---|
 | `http://localhost:3000/api/notifications*` | Notifications service (`:3001`, own PostgreSQL DB) |
+| `http://localhost:3000/api/provider/wallet` and `/api/customer/transactions` | Payments service (`:3002`, own PostgreSQL DB) |
 | `http://localhost:3000/*` | Next.js monolith (`:3000`, internal only — no published port) |
 | `http://localhost:8081` | Keycloak (realm `edemand`; admin console for the demo) |
 
 ```bash
-# Full stack: monolith + notifications service + its PostgreSQL DB + Keycloak + nginx gateway
+# Full stack: monolith, Notifications and Payments with PostgreSQL, Keycloak, RabbitMQ and nginx
 docker compose up -d --build --wait      # http://localhost:3000
-docker compose run --rm test             # 63 tests, in-memory, no server needed
-docker compose down -v                   # also drops the notifications DB volume
+docker compose run --rm --build test     # in-memory suite; no running stack needed
+docker compose down -v                   # reset all project data volumes, including bookings and payments
 
 # App-only local dev (monolith on :3000). The notifications API/UI returns 502 until the extracted
 # service is running; `docker compose up -d notifications notifications-db` gives you one on :3001.
@@ -58,8 +59,50 @@ npm run dev
 cd notifications-service && npm install && DATABASE_URL=postgres://... KEYCLOAK_URL=... npm start
 ```
 
+### Payments & Wallet and the booking saga
+
+Online booking now commits the booking and slot holds in SQLite before asking the private
+Payments service to create one intent in its own PostgreSQL database. Cash bookings still
+skip intent creation. A definitive rejection cancels the booking and releases its slots.
+An unknown outcome returns `202` with `payment_setup: "pending"`. The Booking worker keeps
+trying with the original booking reference, so a committed intent with a lost response is
+reused. The customer can open the booking detail page and pay once setup succeeds.
+
+The Compose stack keeps Booking data in `edemand-data` across restarts and seeds a fresh
+database once. It also preserves Keycloak's data so registered accounts stay paired with the
+local Booking database. An earlier Compose stack did not use these volumes, so the new volumes
+start with demo data. Run `docker compose run --rm --build --no-deps test node --test test/payment-setup-saga.test.js`
+to exercise success, rejection and rebooking, and a committed intent with a lost reply.
+
+Booking orchestrates the saga because it owns the booking lifecycle and can release its slot holds
+in one local transaction. Payments owns intent status, charge and refund records, webhook dedupe,
+and wallet balances. Booking owns its `orders.payment_status` projection. The existing callback
+and Pay Now routes forward settlement to Payments and apply the returned outcome in Booking.
+
+Booking durably records settlement, cancellation, and Wallet delivery work before sending it.
+Payments uses stable references and a local PostgreSQL transaction to apply each financial effect
+once. An online booking must be paid before completion can credit the provider. Cash bookings
+post commission owed at completion. A fresh provider's Wallet reads as zero until its first credit.
+
+Payments independently verifies Keycloak access tokens. Wallet and transaction history are scoped
+to the requesting user's role and ID, and internal writes require the Booking service account.
+On the first upgrade of a persisted SQLite volume, Booking imports the old ledger into PostgreSQL
+and removes the old finance tables only after the import commits. Standalone development and the
+in-memory test suite can run with their local ledger.
+
+For an isolated Docker demo, set `PAYMENTS_DEMO_REJECT_INTENTS=true` to reject new intents
+before writing, or `PAYMENTS_DEMO_DELAY_FIRST_REPLY=true` to delay the first reply until
+after Booking's default timeout, after the intent has committed. Recreate only `payments`
+with `docker compose up -d --wait --no-deps payments` when changing these settings.
+Both settings default to false.
+
+With an isolated Compose stack running on port 3000, run
+`pwsh -File ./scripts/verify-payments.ps1 -ComposeProject <project>` to exercise the public URLs,
+webhook replay, Wallet, refunds, and ownership of the four finance tables. Use a new `-DaysAhead`
+value on subsequent runs so the test bookings use free slots.
+
 Secrets are environment variables. The compose defaults are **demo-only**; override
-`KEYCLOAK_ADMIN_PASSWORD` and `INTERNAL_API_KEY` (see `.env.example`). `JWT_SECRET` remains only for
+`KEYCLOAK_ADMIN_PASSWORD`, `INTERNAL_API_KEY`, and `PAYMENTS_CLIENT_SECRET` (see `.env.example`). `JWT_SECRET` remains only for
 the isolated `node:test` suite, which runs without Keycloak; production tokens are always RS256
 tokens signed by Keycloak and verified through its JWKS.
 
@@ -88,7 +131,7 @@ tables through its own repository; it goes through the owning context's service/
 | 3 | **Provider Profile** | `provider_profiles`, `provider_timings` | Approval, commission, 30-min weekly availability. |
 | 4 | **Booking** | `orders`, `order_items`, `slot_holds`, `addresses` | The place-booking transaction, the status machine, OTP-gated completion, slots. |
 | 5 | **Bidding** | `job_requests`, `bids` | Custom jobs + provider bids; the bid-accept race that spins up a booking. |
-| 6 | **Payments & Wallet** | `payment_intents`, `transactions`, `provider_wallets`, `webhook_events` | Gateway intents, the idempotent webhook, the commission split. |
+| 6 | **Payments & Wallet** | `payment_intents`, `transactions`, `provider_wallets`, `webhook_events` in its **own PostgreSQL DB** (extracted) | Gateway intents, the idempotent webhook, refunds, and the commission split. |
 | 7 | **Reviews** | `reviews` | One review per completed booking; emits `review.created`. |
 | 8 | **Notifications** | `notifications` in its **own PostgreSQL DB** (extracted) | Read side + ownership check in the service. The monolith's outbox relay still drains `events` and delivers commands across the boundary. |
 
@@ -106,7 +149,8 @@ lib/
                                                    payments/gateway.js, notifications/relay.js,
                                                    notifications/client.js)
 notifications-service/  extracted Express service: server.js, app.js, db.js (PostgreSQL), auth.js
-gateway/nginx.conf      the Area A gateway: /api/notifications -> service, everything else -> monolith
+payments-service/       extracted FastAPI service: app.py, auth.py, ledger.py (PostgreSQL)
+gateway/nginx.conf      routes Notifications, Wallet and transaction history to their owning services
 test/ test-helpers/     node:test suite driving the real route handlers in-process
 ```
 
@@ -318,15 +362,16 @@ Each is a genuine mechanism, not a stub, and each has a test proving it.
   realm is imported from a committed JSON file, and the demo uses a published hostname
   (`localhost:8081`) rather than a production ingress with TLS.
 
-Out of scope by design (course adds later): broker/saga, fault injection, tracing/metrics, real
-payment gateways, chat, cart, subscriptions. `SOAP`/`WSDL` appear nowhere.
+Payment settlement and Wallet extraction, the full resilience checks, and tracing/metrics remain
+separate migration work. The payment gateway used in this repo is simulated.
 
 ---
 
 ## Tests
 
 `node --test`, no socket — the suite imports the real App Router route handlers and drives them
-in-process against per-file in-memory databases. 63 tests across:
+in-process against per-file in-memory databases. The payment setup suite also drives an HTTP test
+server to simulate a Payments rejection or a dropped reply. The suites cover:
 
 `health` · `identity` (auth, 401/403/400/409) · `catalog` (pagination, ownership) · `booking`
 (id 8001, the slot double-book race, idempotency, the full status machine, OTP-gated complete +

@@ -23,6 +23,6 @@ export const POST = handle(async (req) => {
     throw new UnauthorizedError("invalid webhook secret");
   }
   const input = parse(schema, await readJson(req));
-  const result = payments.handleWebhook(input);
+  const result = await payments.handleWebhook(input);
   return json({ received: true, ...result }, { status: 200 });
 });
