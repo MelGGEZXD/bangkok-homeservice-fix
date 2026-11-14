@@ -1128,7 +1128,7 @@ Four members, five areas:
 
 | Member | Areas | Primary evidence |
 |---|---|---|
-| Pannadhorn | **A + B** | `verify-area-a.ps1` 32/32, `beat3-auth-rejection.sh` 17/17, `beat1` 12/12 |
+| Pannadhorn Chidchue | **A + B** | `verify-area-a.ps1` 32/32, `beat3-auth-rejection.sh` 17/17, `beat1` 12/12 |
 | Member 2 | **C** | `verify-area-c.sh` 18/18, `test/area-c-events.test.js` |
 | Member 3 | **D** | `beat2-failure-recovery.sh` 20/20, `test/identity-race.test.js` |
 | Thantip Kangwanwanit | **E** | `beat4-find-the-trace.sh` 12/12, `npm run test:pact` 2/2, CI |
