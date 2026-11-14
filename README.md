@@ -32,7 +32,6 @@ trace across both seams, Prometheus/Grafana, and Pact consumer contracts.
 | Repository | <https://github.com/MelGGEZXD/bangkok-homeservice-fix> |
 | Team | 4 members, areas A–E — see [`OWNERS.md`](OWNERS.md) |
 | Architecture dossier | [`docs/dossier.md`](docs/dossier.md) |
-| Recording shot list | [`docs/demo-runbook.md`](docs/demo-runbook.md) |
 | API contract | [`openapi.yaml`](openapi.yaml) |
 | Demo video | [capstone-demo.mp4](https://drive.google.com/file/d/1Jy2vS7yMZjrMLCkc5R1lBBx23fDAR02E/view?usp=sharing) — screen recording on Google Drive |
 
@@ -365,7 +364,7 @@ observability/            prometheus.yml + Grafana provisioning and dashboard
 test/, test-helpers/      node:test suite driving the real route handlers in-process
 test/pact/                Pact consumer contracts
 scripts/                  four beats + Area A and Area C verification
-docs/                     dossier.md, demo-runbook.md
+docs/                     dossier.md
 ```
 
 ---

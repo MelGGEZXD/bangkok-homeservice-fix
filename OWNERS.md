@@ -48,8 +48,7 @@ areas were merged.
 | **E** | 2 consumer contracts, generated into `pacts/` | `npm run test:pact` |
 | **E** | CI jobs: unit, contracts, production build | `act pull_request -j contracts` |
 
-The architecture rationale for every area is in [`docs/dossier.md`](docs/dossier.md). The recorded
-demo shot list is [`docs/demo-runbook.md`](docs/demo-runbook.md).
+The architecture rationale for every area is in [`docs/dossier.md`](docs/dossier.md).
 
 ---
 
