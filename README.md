@@ -34,7 +34,7 @@ trace across both seams, Prometheus/Grafana, and Pact consumer contracts.
 | Architecture dossier | [`docs/dossier.md`](docs/dossier.md) |
 | Recording shot list | [`docs/demo-runbook.md`](docs/demo-runbook.md) |
 | API contract | [`openapi.yaml`](openapi.yaml) |
-| Demo video | `capstone-demo.mp4` — recorded separately from this repository |
+| Demo video | [capstone-demo.mp4](https://drive.google.com/file/d/1Jy2vS7yMZjrMLCkc5R1lBBx23fDAR02E/view?usp=sharing) — screen recording on Google Drive |
 
 ---
 

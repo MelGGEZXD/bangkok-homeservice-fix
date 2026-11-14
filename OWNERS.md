@@ -59,5 +59,6 @@ demo shot list is [`docs/demo-runbook.md`](docs/demo-runbook.md).
 - Tag: `capstone-final`
 - The four demo scripts, their expected output and the reset command are in [`README.md`](README.md).
 - The architecture dossier is [`docs/dossier.md`](docs/dossier.md).
-- The demo video `capstone-demo.mp4` and the confidential peer reviews are submitted separately, not
-  committed to this repository.
+- The demo video [`capstone-demo.mp4`](https://drive.google.com/file/d/1Jy2vS7yMZjrMLCkc5R1lBBx23fDAR02E/view?usp=sharing)
+  is linked from [`README.md`](README.md), not committed to this repository. The confidential peer
+  reviews are submitted separately through the course channel.
