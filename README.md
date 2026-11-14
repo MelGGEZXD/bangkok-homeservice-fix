@@ -56,8 +56,7 @@ trace across both seams, Prometheus/Grafana, and Pact consumer contracts.
 14. [Security notes](#security-notes)
 15. [Design decisions and tradeoffs](#design-decisions-and-tradeoffs)
 16. [Known limitations](#known-limitations)
-17. [Submission checklist](#submission-checklist)
-18. [Team and ownership](#team-and-ownership)
+17. [Team and ownership](#team-and-ownership)
 
 ---
 
@@ -1120,35 +1119,6 @@ Monzo and others), is in [`docs/dossier.md`](docs/dossier.md).
   no TLS.
 - **Out of scope by design** (course adds later): real payment gateways, chat, cart, subscriptions,
   multi-region deployment. SOAP/WSDL appear nowhere.
-
----
-
-## Submission checklist
-
-Repository deliverables:
-
-- [x] Two bounded contexts extracted, each with its own service, database and unchanged public API
-- [x] Notifications and Payments & Wallet both write data (not read-only)
-- [x] Keycloak-only RS256 tokens, verified independently by all three processes
-- [x] Ownership checks and the inherited `GET /api/jobs/{id}` BOLA fixed
-- [x] Outbox → RabbitMQ with publisher confirms and duplicate-delivery dedupe
-- [x] Provider-approval saga with a real compensating action
-- [x] Three injected failures survived with exactly one wallet effect
-- [x] Durable `ledger_commands`, stable `Idempotency-Key`, exponential backoff with full jitter
-- [x] Registration race fixed with a two-thread proof
-- [x] One trace across HTTP and RabbitMQ; Prometheus metrics; Grafana dashboard
-- [x] Pact consumer contracts and CI (`test:unit`, `test:pact`, `build`)
-- [x] `README.md`, `docs/dossier.md`, `docs/demo-runbook.md`, `openapi.yaml`
-- [x] Clean boot with 11 containers running and all verification scripts passing
-- [x] `OWNERS.md` with one owner per area and commit links
-
-Manual deliverables outside the repository:
-
-- [ ] **`capstone-demo.mp4`** — 8–12 minutes, recorded from a clean clone, following
-      [`docs/demo-runbook.md`](docs/demo-runbook.md)
-- [ ] **Peer reviews** — confidential, submitted through the course channel, not committed here
-- [ ] **Owner names and student ids** in [`OWNERS.md`](OWNERS.md) — replace the placeholder identity
-      before the submission form is filled in
 
 ---
 
