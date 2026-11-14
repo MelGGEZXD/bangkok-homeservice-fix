@@ -13,15 +13,15 @@ areas were merged.
 
 ## Team roster
 
-> **Before submitting:** replace `Pannadhorn` with the full legal name and fill the four student IDs.
-> The area ownership and commit links below are final.
+> **Before submitting:** replace `Pannadhorn` with the full legal name and fill the remaining student
+> IDs. The area ownership and commit links below are final.
 
 | Member | Full name | Student ID | Areas owned |
 |---|---|---|---|
 | 1 | **Pannadhorn** | `__________` | **A + B** |
 | 2 | `__________` | `__________` | **C** |
 | 3 | `__________` | `__________` | **D** |
-| 4 | `__________` | `__________` | **E** |
+| 4 | **Thantip Kangwanwanit** | `6622781217` | **E** |
 
 ---
 
@@ -33,7 +33,7 @@ areas were merged.
 | **B — Security** | Keycloak realm and RS256/JWKS verification in all three processes; forged, expired and wrong-audience tokens rejected with 401; service-side ownership; inherited `GET /api/jobs/{id}` BOLA fixed | Pannadhorn | [`2e266ef`](https://github.com/MelGGEZXD/bangkok-homeservice-fix/commit/2e266ef) |
 | **C — Events and saga** | Outbox → RabbitMQ `edemand.events`, durable queues, publisher confirms, duplicate delivery with one effect, provider-approval saga with compensation, orchestration-vs-choreography defence | `Member 2` | [`ce5c257`](https://github.com/MelGGEZXD/bangkok-homeservice-fix/commit/ce5c257) |
 | **D — Failure and idempotency** | Three fault switches (lost reply, slow reply, timed outage) survived with one wallet effect; durable `ledger_commands` and reconciler; timeout + exponential backoff with full jitter; stable `Idempotency-Key`; customer/provider registration race fixed with a two-worker-thread proof | `Member 3` | [`97505b6`](https://github.com/MelGGEZXD/bangkok-homeservice-fix/commit/97505b6) |
-| **E — Observability and contracts** | One OpenTelemetry trace across HTTP and RabbitMQ; Prometheus metrics and Grafana dashboard (request rate, error rate, p95 per service); Pact consumer contracts for both new boundaries; GitHub Actions CI run locally with `act` | `Member 4` | [`97505b6`](https://github.com/MelGGEZXD/bangkok-homeservice-fix/commit/97505b6) |
+| **E — Observability and contracts** | One OpenTelemetry trace across HTTP and RabbitMQ; Prometheus metrics and Grafana dashboard (request rate, error rate, p95 per service); Pact consumer contracts for both new boundaries; GitHub Actions CI run locally with `act` | Thantip Kangwanwanit | [`97505b6`](https://github.com/MelGGEZXD/bangkok-homeservice-fix/commit/97505b6) |
 
 ---
 
