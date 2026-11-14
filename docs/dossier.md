@@ -298,10 +298,10 @@ monolith can own durably in SQLite.
 (`lib/modules/booking/service.js` calls `enqueueLedgerCommand`), and
 `lib/modules/payments/ledger-queue.js` tries the HTTP call immediately, records failures and lets
 `startLedgerReconciler()` retry every 3 seconds. `scripts/beat2-failure-recovery.sh` injects the three
-mandated faults through the payments service's internal control endpoint. Our run on 2026-11-12
-passed all 20 assertions: lost reply survived with HTTP 200 after 141 ms; reply slower than the
-client's 3 s timeout survived after 3162 ms; a 9 s payments outage survived with HTTP 200 after
-761 ms. In every case the order remained completed, the durable command was marked done once, and
+mandated faults through the payments service's internal control endpoint. Our final clean-boot run
+passed all 20 assertions: lost reply survived with HTTP 200 after 162 ms; reply slower than the
+client's 3 s timeout survived after 3230 ms; a 9 s payments outage survived with HTTP 200 after
+616 ms. In every case the order remained completed, the durable command was marked done once, and
 `payments_db` held exactly one ledger row for that order. The client
 (`lib/modules/payments/client.js`) uses `AbortSignal.timeout(3000)`, three attempts,
 `random() * min(4000, 250 * 2^(attempt-1))` (exponential backoff with full jitter), and retries only
@@ -607,15 +607,15 @@ The brief names three failures for Area D. We implemented each as an internal fa
 `lost_reply` and `slow_reply_ms` are one-shot so the retry sees a normal service and proves the retry
 path. The outage is time-based because that is what an outage is.
 
-Our run of `scripts/beat2-failure-recovery.sh` on 2026-11-12 passed 20 assertions:
+Our final clean-boot run of `scripts/beat2-failure-recovery.sh` passed 20 assertions:
 
 ```
-lost reply:      HTTP 200 after 141 ms,  order completed, 1 ledger row, command done
-slow reply:      HTTP 200 after 3162 ms, order completed, 1 ledger row, command done
-9 s outage:      HTTP 200 after 761 ms,  order completed, 1 ledger row, command done
+lost reply:      HTTP 200 after 162 ms,  order completed, 1 ledger row, command done
+slow reply:      HTTP 200 after 3230 ms, order completed, 1 ledger row, command done
+9 s outage:      HTTP 200 after 616 ms,  order completed, 1 ledger row, command done
 ```
 
-The slow-reply number is the useful one: the client's timeout is 3000 ms, so a 3162 ms request is
+The slow-reply number is the useful one: the client's timeout is 3000 ms, so a 3230 ms request is
 evidence that the first attempt timed out and the retry succeeded, not that the service answered
 quickly. The outage number is less than the 9 s window because the order write does not wait for the
 payments service; the response is the booking completion, and the wallet converges later.

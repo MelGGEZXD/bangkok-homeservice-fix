@@ -1,7 +1,7 @@
 {
   "name": "edemand",
   "version": "1.0.0",
-  "description": "DES428 case study — a production-grade on-demand home-services marketplace as a Next.js monolith (App Router + route handlers + SQLite), the system students migrate toward microservices",
+  "description": "DES428 capstone — Bangkok Homeservice (eDemand): a Next.js monolith plus two extracted Express services with their own PostgreSQL databases, Keycloak RS256 identity, RabbitMQ events, OpenTelemetry and Pact contracts",
   "private": true,
   "type": "module",
   "engines": {

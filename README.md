@@ -1,201 +1,431 @@
-# Bangkok Homeservice — a home-services marketplace monolith
+# Bangkok Homeservice (eDemand) — DES428 capstone
 
-> Formerly **eDemand**. Only the course-facing name changed: inside the code the service, the
-> database file, the seed logins and the password below still say `edemand` / `eDemand`.
+An on-demand home-services marketplace that started as the supplied **Next.js monolith** and now
+runs as a monolith **plus two extracted services**, each with its **own PostgreSQL database**, behind
+one nginx gateway.
 
-A production-grade, **self-contained full-stack Next.js monolith** for the DES428 course
-(*Web Services and Service Architecture*). One process, one SQLite file, UI + API together. It is
-the sibling of `bangkok-ride`: same production bar (typed errors, zod validation, JWT auth, pino
-logging, idempotency, atomic conditional writes, real transactions, an outbox, deterministic
-reseed, `node:test` rigor) — but a **multi-vendor on-demand services marketplace** (cleaning,
-repair, beauty, appliance) instead of ride-hailing.
+The monolith still owns the product: identity, catalog, provider profiles, booking, bidding, reviews
+and the UI. Two bounded contexts moved out without changing a single public URL:
 
-Students run this as a monolith, feel where it strains, and use it as the system they migrate
-toward microservices. The bounded-context boundaries below **are** the future service seams.
+| Extracted context | Service | Own database | Public paths (unchanged) |
+|---|---|---|---|
+| Notifications | Express on `:3001` | `notifications_db` | `/api/notifications*` |
+| Payments & Wallet | Express on `:3002` | `payments_db` | `/api/provider/wallet`, `/api/customer/transactions`, `/api/payments/webhook` |
 
-**Capstone deliverables:** [`docs/dossier.md`](docs/dossier.md) (architecture dossier and industrial
-landscape), [`OWNERS.md`](OWNERS.md) (area ownership and commits), [`docs/demo-runbook.md`](docs/demo-runbook.md)
-(the 8–12 minute recording shot list), and the four demo scripts under `scripts/` with their expected
-output in [Demo scripts — the four beats](#demo-scripts--the-four-beats). Submission tag:
-`capstone-final`.
+Everything else in this repository is what makes those seams **defensible**: Keycloak-issued RS256
+tokens verified independently by all three processes, a transactional outbox feeding RabbitMQ, a
+compensating saga, three injected failures survived with exactly one money effect, one OpenTelemetry
+trace across both seams, Prometheus/Grafana, and Pact consumer contracts.
 
 ---
 
-## What it is
+## Submission at a glance
 
-- **The monolith is one deployable.** Next.js 14 App Router. UI pages are Server Components that
-  call the service layer **directly, in-process** (the honest monolith read path). Mutations POST to
-  **route handlers** under `app/api/**`. The same code, one `node server.js`. Area A adds **two**
-  extracted services beside it (Notifications and Payments & Wallet) behind the gateway.
-- **The monolith owns one database.** `better-sqlite3`, one file `data/edemand.db` (`:memory:`
-  under test). WAL, `foreign_keys=ON`. Dropped, migrated and **reseeded on every boot** — a fresh
-  `docker compose up` is always identical. `sqlite_sequence` for `orders` is primed to 8000, so the
-  **first booking on a fresh boot is always id 8001**. The extracted services own **separate
-  PostgreSQL databases**; the monolith has no `notifications` table and none of the four money
-  tables (`payment_intents`, `transactions`, `provider_wallets`, `webhook_events`).
-- **Layered.** `route handler → service → repository → db`. No SQL outside repositories; no business
-  logic in route files. Every route is zod-validated, typed-error-mapped, JWT+role-gated where
-  required, and request-id + pino logged.
-
-### Run it
-
-**Areas A and B are in place:** the public entry point is the **nginx gateway on `:3000`**, and it
-keeps the addresses the app already had. Keycloak is the only token issuer; it is an identity
-dependency, not part of the domain API surface.
-
-| Public URL | Routed to |
+| Item | Value |
 |---|---|
-| `http://localhost:3000/api/notifications*` | Notifications service (`:3001`, own PostgreSQL DB) |
-| `http://localhost:3000/api/provider/wallet` | Payments & Wallet service (`:3002`, own PostgreSQL DB) |
-| `http://localhost:3000/api/customer/transactions` | Payments & Wallet service (`:3002`, own PostgreSQL DB) |
-| `http://localhost:3000/api/payments/webhook` | Payments & Wallet service (`:3002`, own PostgreSQL DB) |
-| `http://localhost:3000/*` | Next.js monolith (`:3000`, internal only — no published port) |
-| `http://localhost:8081` | Keycloak (realm `edemand`; admin console for the demo) |
-| `http://localhost:15672` | RabbitMQ management console (`edemand` / `edemand-demo-pass`) |
-| `http://localhost:16686` | Jaeger trace UI (Area E) |
-| `http://localhost:9090` | Prometheus (Area E; scrapes all three services) |
-| `http://localhost:3005` | Grafana (Area E; anonymous admin, dashboard pre-provisioned) |
+| Course | DES428 — Web Services and Service Architecture |
+| System | Bangkok Homeservice (formerly **eDemand**; code identifiers keep the old name) |
+| Baseline | Supplied Next.js 14 monolith, one process, one SQLite file |
+| Final runtime | 11 Docker containers (monolith + 2 services + 2 DBs + gateway + Keycloak + RabbitMQ + Jaeger + Prometheus + Grafana) |
+| Submission branch | `main` (development branch: `area-a-second`) |
+| Submission tag | `capstone-final` |
+| Repository | <https://github.com/MelGGEZXD/bangkok-homeservice-fix> |
+| Team | 4 members, areas A–E — see [`OWNERS.md`](OWNERS.md) |
+| Architecture dossier | [`docs/dossier.md`](docs/dossier.md) |
+| Recording shot list | [`docs/demo-runbook.md`](docs/demo-runbook.md) |
+| API contract | [`openapi.yaml`](openapi.yaml) |
+| Demo video | `capstone-demo.mp4` — recorded separately from this repository |
 
-`/api/internal/*`, `/internal/*` and `/metrics` are refused by the gateway: those endpoints exist
-only on the compose network.
+---
+
+## Contents
+
+1. [What changed, and what stayed](#what-changed-and-what-stayed)
+2. [Prerequisites](#prerequisites)
+3. [Quick start](#quick-start)
+4. [URLs and logins](#urls-and-logins)
+5. [Architecture](#architecture)
+6. [Area A — two extractions](#area-a--two-extractions)
+7. [Area B — security](#area-b--security)
+8. [Area C — events, duplicate delivery, saga](#area-c--events-duplicate-delivery-and-the-saga)
+9. [Area D — failures and idempotency](#area-d--timeouts-retries-idempotency-and-one-repaired-race)
+10. [Area E — traces, metrics, contracts](#area-e--traces-metrics-dashboard-and-contract-tests)
+11. [The four demo beats](#the-four-demo-beats)
+12. [Verification matrix](#verification-matrix)
+13. [Troubleshooting](#troubleshooting)
+14. [Security notes](#security-notes)
+15. [Design decisions and tradeoffs](#design-decisions-and-tradeoffs)
+16. [Known limitations](#known-limitations)
+17. [Submission checklist](#submission-checklist)
+18. [Team and ownership](#team-and-ownership)
+
+---
+
+## What changed, and what stayed
+
+| Concern | Before (supplied monolith) | After |
+|---|---|---|
+| Public entry point | Next.js on `:3000` | **nginx gateway on `:3000`** |
+| Notifications | SQLite table inside the monolith | Express service + `notifications_db` |
+| Payments & Wallet | SQLite tables inside the monolith | Express service + `payments_db` |
+| Identity | Monolith minted HS256 tokens with a local secret | **Keycloak** issues RS256 tokens; every process verifies JWKS locally |
+| Domain events | Polled table / in-process delivery | Transactional **outbox → RabbitMQ** with publisher confirms |
+| Provider approval | One local write | Orchestrated **saga** with a compensating action |
+| Money under failure | Not exercised | Timeout + retry + full jitter, durable ledger commands, idempotency keys |
+| Observability | Logs only | OpenTelemetry → Jaeger, Prometheus → Grafana |
+| Contracts | None | **Pact** consumer contracts for both new boundaries |
+| UI and public API | — | **Unchanged**; the app still opens at `http://localhost:3000` |
+
+What deliberately **did not** change:
+
+- The Next.js App Router UI, pages and route handlers that were not on the seam.
+- The database engine for the monolith (SQLite, `better-sqlite3`) and its deterministic reseed.
+- The public API shape, status codes and error envelope.
+- Seed users, booking ids (first booking on a clean boot is always **8001**) and the demo flow.
+
+The brief says to change the monolith only as much as the migration requires. We kept its language,
+its UI and its public contract, removed the moved tables, and replaced the old in-process calls with
+HTTP clients and an internal settlement callback.
+
+---
+
+## Prerequisites
+
+### Required
+
+| Requirement | Why |
+|---|---|
+| **Docker Desktop 4.x** with **Compose v2** (`docker compose version`) | Everything runs in containers; no cloud account, no local database install |
+| **8 GB RAM** free for Docker | 11 containers, two PostgreSQL instances, Keycloak and the JVM-free observability stack |
+| **~6 GB disk** | Images plus four named volumes |
+| **Git** | Clone the tagged submission |
+| Ports `3000`, `3005`, `5672`, `8081`, `9090`, `15672`, `16686`, `4318` free | Published host ports |
+
+### Optional
+
+| Requirement | Why |
+|---|---|
+| **Node.js 20** (`.nvmrc`) | Only for running `npm test` / `npm run dev` outside Docker. `better-sqlite3@11.10.0` has no prebuilt binary for Node 24 on Windows |
+| **PowerShell** (Windows built-in, or PowerShell 7) | Run `scripts/verify-area-a.ps1`; the script is written for Windows PowerShell 5.1 and also runs under `pwsh` |
+| **Git Bash** (Windows) | To run the four `scripts/beat*.sh` scripts locally |
+
+> **Windows note.** In PowerShell, `bash` may resolve to `C:\Windows\System32\bash.exe` (WSL), which
+> fails with `execvpe(/bin/bash): No such file or directory` when the WSL distro has no `/bin/bash`.
+> Use Git Bash explicitly:
+>
+> ```powershell
+> & "C:\Program Files\Git\bin\bash.exe" scripts/beat1-happy-path.sh
+> ```
+>
+> Or run the same command from a Git Bash window. This affects only the demo scripts, not the stack.
+
+### Published host ports
+
+| Host port | Container | Purpose |
+|---|---|---|
+| `3000` | `gateway` (nginx) | **The only application entry point** |
+| `3005` | `grafana` | Dashboards |
+| `5672` | `rabbitmq` | AMQP (optional tooling) |
+| `8081` | `keycloak` | Realm issuer, token endpoint, admin console |
+| `9090` | `prometheus` | Metrics query UI |
+| `15672` | `rabbitmq` | Management console |
+| `16686` | `jaeger` | Trace UI |
+| `4318` | `jaeger` | OTLP/HTTP collector |
+
+The monolith, both Express services and both PostgreSQL databases publish **no host ports**. They are
+reachable only on the compose network.
+
+---
+
+## Quick start
+
+This is the whole setup. There is no database to install and no migration to run.
 
 ```bash
-# Full stack: monolith + two extracted services + two PostgreSQL DBs + Keycloak + RabbitMQ +
-# Jaeger + Prometheus + Grafana + gateway
-docker compose up -d --build --wait      # http://localhost:3000
-docker compose run --rm test             # 76 unit/concurrency tests, in-memory, no server needed
-docker compose down -v                   # first boot: drops both extracted DBs, RabbitMQ and Grafana
+git clone https://github.com/MelGGEZXD/bangkok-homeservice-fix.git
+cd bangkok-homeservice-fix
+git checkout capstone-final
+
+docker compose up -d --build --wait
+docker compose ps
 ```
 
-# App-only local dev (monolith on :3000). Extracted-service calls return 502 until they run. Start
-# the dependencies, then export RABBITMQ_URL and the service URLs:
-docker compose up -d rabbitmq notifications notifications-db payments payments-db
-export RABBITMQ_URL=amqp://edemand:edemand-demo-pass@localhost:5672
-export NOTIFICATIONS_SERVICE_URL=http://localhost:3001 PAYMENTS_SERVICE_URL=http://localhost:3002
-npm install
-npm run dev
-# or: npm run build && npm start
+`--wait` returns only when every container with a healthcheck is healthy. A **clean first boot takes
+2–4 minutes** because Keycloak imports the realm and both services wait for its JWKS before they
+listen. Subsequent boots are faster.
 
-# Each extracted service by itself (needs DATABASE_URL + KEYCLOAK_URL; notifications also RABBITMQ_URL)
-cd notifications-service && npm install && DATABASE_URL=postgres://... KEYCLOAK_URL=... RABBITMQ_URL=... npm start
-cd payments-service      && npm install && DATABASE_URL=postgres://... KEYCLOAK_URL=... npm start
+Expected: **11 containers running**, with the nine healthchecked services `healthy`.
+
+```text
+gateway          running        edemand          healthy
+notifications    healthy        payments         healthy
+notifications-db healthy        payments-db      healthy
+rabbitmq         healthy        keycloak         running
+jaeger           healthy        prometheus       healthy
+grafana          running
 ```
 
-Secrets are environment variables. The compose defaults are **demo-only**; override
-`KEYCLOAK_ADMIN_PASSWORD` and `INTERNAL_API_KEY` (see `.env.example`). `JWT_SECRET` remains only for
-the isolated `node:test` suite, which runs without Keycloak; production tokens are always RS256
-tokens signed by Keycloak and verified through its JWKS.
+The two without a healthcheck are surfaced in the browser anyway: Keycloak's realm page and the
+Grafana dashboard.
 
-> **Node version for local tests:** use **Node 20** (`.nvmrc`). `better-sqlite3@11.10.0` ships no
-> prebuilt binary for Node 24, and building it from source needs Visual Studio C++ tools on Windows.
-> `docker compose run --rm test` always uses the Node 20 image and is the safest way to run the suite.
+### Health check
 
-**Seed logins** (password for all: `eDemand-2026!`):
-`nong@example.com` / `somchai@example.com` / `aom@example.com` (customers),
-`sparkle@example.com` / `fixit@example.com` (approved providers), `glow@example.com` (pending),
-`admin@edemand.test` (admin). The same accounts are imported into the Keycloak realm, so the login
-endpoints and `http://localhost:8081` both accept them. Keycloak admin console: `admin` / `admin`
-(demo only).
+```bash
+curl -s http://localhost:3000/api/health
+```
+
+```json
+{"status":"ok","service":"edemand","database":"up"}
+```
+
+### Reset to first boot
+
+```bash
+docker compose down -v
+docker compose up -d --build --wait
+```
+
+`down -v` drops both extracted PostgreSQL volumes, the RabbitMQ volume and the Grafana volume. The
+monolith reseeds SQLite on every start, so booking ids return to `8001` and the ecosystem is
+byte-for-byte deterministic.
+
+### Stop without losing data
+
+```bash
+docker compose down
+```
+
+### Run the tests (no running stack required)
+
+```bash
+docker compose run --rm test
+```
+
+Expected: **78 tests, 78 pass, 0 fail** (76 functional + 2 Pact contract files). The functional suite
+boots its own in-memory SQLite databases and needs no running stack; the two Pact files start a local
+mock provider and also need no external service.
+
+### Configuration
+
+Everything is environment variables, and [`.env.example`](.env.example) documents every knob with its
+demo default. The compose file supplies working values without a `.env`, so a clean clone boots with
+no configuration. Copy `.env.example` to `.env` only when you want to override something; the
+comments explain which values must change for a real deployment.
 
 ---
 
-## The eight bounded contexts
+## URLs and logins
 
-Each context **owns its tables** — that ownership is the seam. Nothing reads another context's
-tables through its own repository; it goes through the owning context's service/repository.
+### Open these for the demo
 
-| # | Context | Owns (tables) | Responsibility |
-|---|---------|---------------|----------------|
-| 1 | **Identity** | `customers`, `providers`, `admins` | Registration, login (bcrypt), JWT issuance, `/me`. |
-| 2 | **Catalog** | `categories`, `services` | Provider-owned services, browse/search, rating aggregate (recomputed by the relay). |
-| 3 | **Provider Profile** | `provider_profiles`, `provider_timings` | Approval, commission, 30-min weekly availability. |
-| 4 | **Booking** | `orders`, `order_items`, `slot_holds`, `addresses` | The place-booking transaction, the status machine, OTP-gated completion, slots. |
-| 5 | **Bidding** | `job_requests`, `bids` | Custom jobs + provider bids; the bid-accept race that spins up a booking. |
-| 6 | **Payments & Wallet** | `payment_intents`, `transactions`, `provider_wallets`, `webhook_events` in its **own PostgreSQL DB** (extracted) | Gateway intents, the idempotent webhook, the commission split. Money writes are idempotent by order and kind. |
-| 7 | **Reviews** | `reviews` | One review per completed booking; emits `review.created`. |
-| 8 | **Notifications** | `notifications` in its **own PostgreSQL DB** (extracted) | Read side + ownership check in the service. Consumes domain events from RabbitMQ and owns the event → notification projection. |
+| # | URL | What it shows | Area |
+|---|---|---|---|
+| 1 | <http://localhost:3000> | The app through the gateway | A |
+| 2 | <http://localhost:8081> | Keycloak realm, users, clients, RS256 keys | B |
+| 3 | <http://localhost:16686> | One trace across all three services | E |
+| 4 | <http://localhost:3005> | Request rate, error rate, p95 per service | E |
+| 5 | <http://localhost:15672> | Exchange `edemand.events`, queues, consumers | C |
+| 6 | <http://localhost:9090> | Scrape targets for all three services | E |
 
-Shared infra (under `lib/db`, not a context): `events` (the outbox) and `idempotency_keys`.
+**Minimum for an individual defence: 4 tabs.** Add 5 and 6 for the full team.
 
-Directory shape:
+### Seed accounts
 
+Password for **every** application user: **`eDemand-2026!`**
+
+| Email | Role | Notes |
+|---|---|---|
+| `nong@example.com` | customer | Main demo customer |
+| `somchai@example.com` | customer | Used for the BOLA "unrelated customer" case |
+| `aom@example.com` | customer | Third customer |
+| `sparkle@example.com` | provider | Approved; wallet demo |
+| `fixit@example.com` | provider | Approved; bidding demo |
+| `glow@example.com` | provider | Starts **pending**; the approval saga approves it |
+| `admin@edemand.test` | admin | Approves providers, reads sagas |
+
+Login pages:
+
+- Customer: <http://localhost:3000/login>
+- Provider: <http://localhost:3000/provider/login>
+- Admin: <http://localhost:3000/admin/login>
+
+Keycloak admin console (inspect only): <http://localhost:8081/admin> → **`admin` / `admin`**.
+RabbitMQ management: **`edemand` / `edemand-demo-pass`**. Both are demo defaults; see
+[Security notes](#security-notes).
+
+> The app does **not** log in through the Keycloak UI. The app's own forms forward credentials to
+> Keycloak's token endpoint and store the returned token in an httpOnly cookie. Port `8081` is for
+> inspecting the realm.
+
+---
+
+## Architecture
+
+```text
+                             browser / curl
+                                   |
+                                   v
+                    +-------------------------------+
+                    |   nginx gateway   :3000        |
+                    |   the only app host port       |
+                    +----+--------------+-----------+
+                         |              |
+     /api/notifications  |              |  /api/provider/wallet
+                         |              |  /api/customer/transactions
+                         |              |  /api/payments/webhook
+                         v              v
+              +------------------+   +----------------------+
+              | notifications    |   | payments             |
+              | Express :3001    |   | Express :3002       |
+              +--------+---------+   +----------+-----------+
+                       |                        |
+              notifications_db            payments_db
+                       ^                        ^
+                       |    RabbitMQ            |
+                       |    edemand.events      |
+                       |    edemand.notifications
+                       |    edemand.sagas
+              +--------+------------------------+-----------+
+              |  Next.js monolith :3000 (internal)            |
+              |  SQLite + outbox + sagas + ledger_commands     |
+              |  Keycloak JWKS verifier                        |
+              +-----------------------------------------------+
+
+  All three processes --OTLP/HTTP--> Jaeger :4318
+  Prometheus :9090 --scrape /metrics--> monolith, notifications, payments
+  Grafana :3005 --> Prometheus
 ```
-app/                 UI pages ((customer) (provider) (admin) groups) + api/** route handlers
+
+### Runtime topology
+
+| Service | Kind | Internal port | Host port | Owns | Area |
+|---|---|---|---|---|---|
+| `gateway` | nginx | 80 | **3000** | Routing, correlation id, internal-path denial | A |
+| `edemand` | Next.js 14 | 3000 | none | UI, API, SQLite, outbox, sagas | — |
+| `notifications` | Express | 3001 | none | `notifications_db` | A |
+| `payments` | Express | 3002 | none | `payments_db` | A |
+| `notifications-db` | PostgreSQL 15 | 5432 | none | `notifications` table | A |
+| `payments-db` | PostgreSQL 15 | 5432 | none | Money tables | A |
+| `keycloak` | Keycloak 26 | 8080 | 8081 | Realm, users, signing keys | B |
+| `rabbitmq` | RabbitMQ 3.13 | 5672 / 15672 | 5672 / 15672 | Exchange and durable queues | C |
+| `jaeger` | Jaeger all-in-one | 16686 / 4318 | 16686 / 4318 | Trace storage and UI | E |
+| `prometheus` | Prometheus | 9090 | 9090 | Metrics scrape and storage | E |
+| `grafana` | Grafana | 3000 | 3005 | Dashboards | E |
+
+### One writer per table
+
+This is the rule that makes the seams real, not cosmetic.
+
+| Database | Tables | Owner |
+|---|---|---|
+| Monolith SQLite (`data/edemand.db`) | `categories`, `customers`, `providers`, `admins`, `provider_profiles`, `provider_timings`, `services`, `addresses`, `job_requests`, `orders`, `order_items`, `slot_holds`, `bids`, `reviews`, `events`, `sagas`, `idempotency_keys`, `ledger_commands` | Monolith |
+| `notifications_db` | `notifications` | Notifications service |
+| `payments_db` | `payment_intents`, `transactions`, `provider_wallets`, `webhook_events`, `idempotency_keys` | Payments service |
+
+The monolith schema **does not create** `notifications`, `payment_intents`, `transactions`,
+`provider_wallets` or `webhook_events`. If old code tried to read them, it would fail at SQLite. The
+only way to reach that data is across the seam.
+
+### The eight bounded contexts
+
+Each context owns its tables. Nothing reads another context's tables through its own repository; it
+goes through the owning context.
+
+| # | Context | Owns | Responsibility |
+|---|---|---|---|
+| 1 | **Identity** | `customers`, `providers`, `admins` | Registration, login, Keycloak provisioning, `/me` |
+| 2 | **Catalog** | `categories`, `services` | Provider services, browse/search, rating aggregate |
+| 3 | **Provider Profile** | `provider_profiles`, `provider_timings` | Approval, commission, weekly availability |
+| 4 | **Booking** | `orders`, `order_items`, `slot_holds`, `addresses` | Place-booking transaction, status machine, OTP completion |
+| 5 | **Bidding** | `job_requests`, `bids` | Custom jobs, bids, the accept race |
+| 6 | **Payments & Wallet** | `payment_intents`, `transactions`, `provider_wallets`, `webhook_events`, `idempotency_keys` in **`payments_db`** | Intents, idempotent webhook, commission split |
+| 7 | **Reviews** | `reviews` | One review per completed booking; emits `review.created` |
+| 8 | **Notifications** | `notifications` in **`notifications_db`** | Inbox, ownership check, event → notification projection |
+
+Shared infrastructure (not a context): `events` (outbox), `sagas`, `ledger_commands`, monolith
+`idempotency_keys`.
+
+### Directory map
+
+```text
+app/                      UI pages ((customer) (provider) (admin)) + api/** route handlers
 lib/
-  config.js logger.js errors.js
-  http/              handle, respond, auth, validate, pagination, requestId, session
-  db/                index, schema, migrate, seed, bootstrap, idempotency, events
-  messaging/         rabbit.js (connection + confirms), publisher.js (outbox -> broker)
-  modules/<context>/ repository.js + service.js  (+ booking/slots.js, booking/availability.js,
-                                                   payments/client.js, notifications/relay.js,
-                                                   notifications/client.js, sagas/*)
-notifications-service/  extracted Express service: server.js, app.js, db.js (PostgreSQL), auth.js,
-                        broker.js (RabbitMQ consumer), notification-rules.cjs, faults.js
-payments-service/       extracted Express service: server.js, app.js, db.js (PostgreSQL), auth.js,
-                        keycloak.js (JWKS verifier), config.js
-gateway/nginx.conf      the Area A gateway: each extracted prefix -> its service, else -> monolith
-test/ test-helpers/     node:test suite driving the real route handlers in-process
+  http/                   handle, respond, auth, keycloak (JWKS), validate, session
+  db/                     index, schema, migrate, seed, bootstrap, events, idempotency
+  messaging/              rabbit.js (connection + confirms), publisher.js (outbox -> broker)
+  modules/<context>/      repository.js + service.js
+                          booking/slots.js, payments/client.js, payments/ledger-queue.js,
+                          notifications/relay.js, notifications/client.js, sagas/*
+  telemetry.js            OpenTelemetry bootstrap
+notifications-service/    Express service: app.js, db.js (Postgres), auth.js, keycloak.js,
+                          broker.js (RabbitMQ consumer), notification-rules.cjs, faults.js
+payments-service/         Express service: app.js, db.js (Postgres), auth.js, keycloak.js
+gateway/nginx.conf        public prefixes -> extracted services, everything else -> monolith
+keycloak/                 realm-edemand.json (users, roles, clients, mappers)
+observability/            prometheus.yml + Grafana provisioning and dashboard
+test/, test-helpers/      node:test suite driving the real route handlers in-process
+test/pact/                Pact consumer contracts
+scripts/                  four beats + Area A and Area C verification
+docs/                     dossier.md, demo-runbook.md
 ```
 
-### Area A — two extractions (team scope)
+---
 
-A team of 4–5 must move **two** parts, each into its own service with its own database, and at
-least one must change data rather than only read it. This repository ships both:
+## Area A — two extractions
+
+**Claim:** two bounded contexts can leave the monolith without changing a public address or leaving a
+moved table behind, because each has one owner, its own database, and a contract at the boundary.
+
+The brief requires **two** parts moved, each into its own service with its own database, and at least
+one must **change data**. Both extractions write:
 
 | Extracted service | Public prefix | Own database | Writes data? |
 |---|---|---|---|
-| Notifications | `/api/notifications*` | `notifications_db` | yes: creates and marks notifications |
-| Payments & Wallet | `/api/provider/wallet`, `/api/customer/transactions`, `/api/payments/webhook` | `payments_db` | yes: payment intents, ledger entries, wallet balances, webhook dedupe |
+| Notifications | `/api/notifications*` | `notifications_db` | Yes: creates and marks notifications |
+| Payments & Wallet | `/api/provider/wallet`, `/api/customer/transactions`, `/api/payments/webhook` | `payments_db` | Yes: intents, ledger entries, wallet balances, webhook dedupe |
 
-#### Area A.1 — Notifications
+### A.1 — Notifications
 
 | The four boundary questions | Answer |
 |---|---|
 | **Name** | Notifications |
-| **What crosses** | *Inbound:* the monolith's relay `POST /internal/notifications` (shared `X-Internal-Key`, one command per outbox event). *Outbound:* the browser/API `GET /api/notifications` and `POST /api/notifications/:id/read`, carrying the caller's JWT. |
-| **Ownership** | The service owns `notifications` in its **own PostgreSQL database**. The monolith schema drops the legacy SQLite table and no longer has a notifications repository. |
-| **Decision** | Extract the lowest-risk context first: it is asynchronous, has one small table, and nothing calls it synchronously on a request's hot path. |
+| **What crosses** | *Inbound:* domain events from RabbitMQ (Area C), plus the legacy internal command `POST /internal/notifications` (shared `X-Internal-Key`). *Outbound:* `GET /api/notifications`, `POST /api/notifications/:id/read`, carrying the caller's JWT. |
+| **Ownership** | The service owns `notifications` in its own PostgreSQL database. The monolith schema drops the legacy SQLite table and has no notifications repository. |
+| **Decision** | Extract the lowest-risk context first: asynchronous, one small table, no synchronous caller on the booking hot path. |
 
-**Why this seam, not Providers/Booking?** The assignment table names Providers and Booking, but this
-repository's own seam analysis ranks Notifications first: it owns one table and has no synchronous
+Why this seam, not Providers or Booking? The assignment table suggests Providers and Booking, but
+this system's own analysis ranks Notifications first: it owns one table and has no synchronous
 hot-path caller. Booking and Bidding share the `slot_holds` UNIQUE guard, so splitting them first
-turns a free single-DB invariant into distributed reservation. The dossier should state this
-tradeoff explicitly if the marker expects the table's suggestion.
+turns a free single-database invariant into distributed reservation. The dossier records that
+tradeoff explicitly.
 
-What makes the cut real rather than a stub:
+What makes the cut real:
 
-- **Same public addresses.** nginx publishes `:3000` and routes `/api/notifications*` to the service;
-  the monolith keeps no host port. The UI page `/notifications` still lives at the same URL and
-  fetches the service with the browser's httpOnly JWT.
-- **Idempotent delivery.** Every domain event carries the outbox UUID (`source_event_id`). The
-  service has a unique key on `(source_event_id, recipient_role, recipient_id, type)` and inserts
-  with `ON CONFLICT DO NOTHING`. The relay releases a failed publish claim and retries —
-  at-least-once delivery, exactly-one effect. Area C moves this hop onto RabbitMQ; the dedupe key
-  is unchanged.
+- **Same public address.** nginx publishes `:3000` and routes `/api/notifications*` to the service.
+  The UI page `/notifications` is still at the same URL and fetches the service with the browser's
+  httpOnly JWT.
+- **Idempotent delivery.** Every event carries the outbox UUID (`source_event_id`). The table has
+  `UNIQUE (source_event_id, recipient_role, recipient_id, type)` and inserts with
+  `ON CONFLICT DO NOTHING`, so at-least-once delivery has exactly one effect.
 - **The service checks the token itself.** `notifications-service/auth.js` verifies the Keycloak
-  RS256 token against the realm JWKS and derives the recipient from it, never from a query string.
-  Mark-read also checks ownership (`403 not your notification`). See Area B below.
-- **Approval is still atomic.** `approveProvider` writes the flag flip, the `provider_approval`
-  saga row and the `provider.approved` outbox event in the same SQLite transaction; the relay
-  publishes afterwards. The monolith never writes the moved table.
+  RS256 token against the realm JWKS and derives the recipient from the token, never from a query
+  string. Mark-read also checks ownership and returns `403` for someone else's row.
+- **Approval is still atomic.** `approveProvider` writes the flag flip, the `provider_approval` saga
+  row and the `provider.approved` outbox event in one SQLite transaction. The monolith never writes
+  the moved table.
 
-Proof from the running stack (`jq` for token extraction):
+Proof:
 
 ```bash
-docker compose up -d --build --wait
-
-# 1. The gateway routes /api/notifications to the extracted service. This 401 body has no
-#    monolith-style requestId, which is one quick way to see which process answered.
+# Anonymous call answered by the extracted service, not the monolith: no requestId in the body.
 curl -i http://localhost:3000/api/notifications
 
-# 2. Log in as admin and approve the seeded pending provider Glow (id 3).
 ADMIN=$(curl -s -X POST http://localhost:3000/api/auth/admin/login \
   -H 'content-type: application/json' \
   -d '{"email":"admin@edemand.test","password":"eDemand-2026!"}' | jq -r .token)
 curl -s -X POST http://localhost:3000/api/admin/providers/3/approve \
   -H "authorization: Bearer $ADMIN"
 
-# 3. Wait one relay tick, then read Glow's inbox through the same public address.
 sleep 2
 GLOW=$(curl -s -X POST http://localhost:3000/api/auth/provider/login \
   -H 'content-type: application/json' \
@@ -203,214 +433,282 @@ GLOW=$(curl -s -X POST http://localhost:3000/api/auth/provider/login \
 curl -s -H "authorization: Bearer $GLOW" http://localhost:3000/api/notifications
 ```
 
-Expected: one `provider_approved` notification, served from PostgreSQL by the extracted service.
-The monolith's SQLite file has no `notifications` table.
+Expected: one `provider_approved` notification, served from PostgreSQL. The monolith SQLite file has
+no `notifications` table. (The snippets use `jq` to pick tokens; the beat scripts avoid that
+dependency by parsing with Node.)
 
-#### Area A.2 — Payments & Wallet
+### A.2 — Payments & Wallet
 
 | The four boundary questions | Answer |
 |---|---|
 | **Name** | Payments & Wallet |
-| **What crosses** | *Inbound from the monolith:* `POST /internal/payment-intents`, `POST /internal/wallets`, `POST /internal/ledger/booking-completed`, `POST /internal/ledger/booking-cancelled`, `POST /internal/simulate` (shared `X-Internal-Key`). *Inbound from clients:* `GET /api/provider/wallet`, `GET /api/customer/transactions` (JWT, verified by the service) and `POST /api/payments/webhook` (shared `X-Webhook-Secret`). *Outbound:* `POST /api/internal/orders/:id/payment-status` so the order owner learns the money settled. |
-| **Ownership** | The service owns `payment_intents`, `transactions`, `provider_wallets` and `webhook_events` in **`payments_db`**. The monolith schema drops all four and has no payments repository. |
+| **What crosses** | *Inbound from the monolith:* `POST /internal/payment-intents`, `POST /internal/wallets`, `POST /internal/ledger/booking-completed`, `POST /internal/ledger/booking-cancelled`, `POST /internal/simulate` (shared `X-Internal-Key`). *Inbound from clients:* `GET /api/provider/wallet`, `GET /api/customer/transactions` (JWT, verified by the service) and `POST /api/payments/webhook` (`X-Webhook-Secret`). *Outbound:* `POST /api/internal/orders/:id/payment-status`, so the order owner learns the money settled. |
+| **Ownership** | `payment_intents`, `transactions`, `provider_wallets`, `webhook_events` and `idempotency_keys` live in **`payments_db`**. The monolith schema drops all four money tables and has no payments repository. |
 | **Decision** | Second extraction because it is the highest-write context with a genuinely separate aggregate: money rows never need a join back into `orders`. It also gives Area D a real idempotency target and Area C a real participant. |
 
-Why this one, not Catalog/Provider? Provider data is joined by `services`, `orders`, `bids` and
-`job_requests`; extracting it first forces cross-service reads into the hot booking path. Money
-rows are referenced only by `order_id`, so the seam is narrow and the write volume justifies the
-split.
+Why this one, not Catalog or Provider? Provider data is joined by `services`, `orders`, `bids` and
+`job_requests`; extracting it first forces cross-service reads into the hot booking path. Money rows
+are referenced only by `order_id`, so the seam is narrow and the write volume justifies the split.
 
 What makes the cut real:
 
-- **Same public addresses.** The wallet, ledger and webhook URLs are unchanged; nginx routes those
-  prefixes to `payments:3002`. `/api/payments/simulate` deliberately stays on the monolith, because
-  only the monolith owns `orders` and can prove the caller is the customer before money moves.
-- **The monolith really cannot touch the rows.** `lib/db/schema.js` drops and does not recreate the
-  four tables, and `lib/modules/payments/` contains only an HTTP client — no SQL. Provider
-  registration calls `POST /internal/wallets`; booking completion calls the ledger endpoint.
-- **Exactly-once money writes.** `payment_intents.order_id` is `UNIQUE` (a retried booking cannot
-  create two intents) and `transactions(order_id, kind)` is `UNIQUE` (a redelivered webhook or a
-  retried completion cannot double-credit). `webhook_events.gateway_event_id` is the replay key.
+- **Same public addresses.** Wallet, ledger and webhook URLs are unchanged. `/api/payments/simulate`
+  deliberately stays on the monolith, because only the monolith owns `orders` and can prove the
+  caller is the customer before money moves.
+- **The monolith cannot touch the rows.** `lib/db/schema.js` does not recreate the four tables, and
+  `lib/modules/payments/` contains only an HTTP client — no SQL. Provider registration calls
+  `POST /internal/wallets`; booking completion calls the ledger endpoint.
+- **Exactly-once money writes.** `payment_intents.order_id` is `UNIQUE`; `transactions(order_id, kind)`
+  is `UNIQUE`; `webhook_events.gateway_event_id` is the replay key.
 - **The service checks the token itself.** `payments-service/auth.js` verifies the Keycloak RS256
-  token against the realm JWKS, derives the provider/customer id from `local_id`, and returns 403
-  when the role does not match the route.
+  token, derives the provider/customer id from `local_id`, and returns `403` when the role does not
+  match the route.
 - **Order state stays with the order owner.** After the money transaction commits, the service calls
-  the monolith's internal, idempotent settlement endpoint. The `orders.payment_status` update is
-  conditional, and the `payment.succeeded` outbox event is emitted only on the first transition.
+  the monolith's internal idempotent settlement endpoint. The `orders.payment_status` update is
+  conditional, and `payment.succeeded` is emitted only on the first transition.
 
-Proof from the running stack:
+Proof:
 
 ```bash
-docker compose up -d --build --wait
-
-# 1. The payments service answers this 401 itself (no monolith requestId in the body).
+# The payments service answers this 401 itself (no monolith requestId in the body).
 curl -i http://localhost:3000/api/provider/wallet
 
-# 2. A provider token reads its own wallet from PostgreSQL.
 SPARKLE=$(curl -s -X POST http://localhost:3000/api/auth/provider/login \
   -H 'content-type: application/json' \
   -d '{"email":"sparkle@example.com","password":"eDemand-2026!"}' | jq -r .token)
 curl -s -H "authorization: Bearer $SPARKLE" http://localhost:3000/api/provider/wallet
-
-# 3. A gateway webhook settles a booking once; the same event id again is a 200 no-op.
-curl -s -X POST http://localhost:3000/api/payments/webhook \
-  -H 'content-type: application/json' -H 'x-webhook-secret: edemand-webhook-secret' \
-  -d '{"gateway_event_id":"evt-1","type":"payment_intent.succeeded","gateway_ref":"SIM-PI-..."}'
 ```
 
-The full proof — including one-charge-after-replay and the wallet row appearing in `payments_db` —
-is `scripts/verify-area-a.ps1`. Reset with `docker compose down -v`, which drops both extracted
-databases as well as RabbitMQ.
+### Why the public API did not change
 
-### Area B — Keycloak tokens, ownership, and the BOLA fix
+The client contract is the **address**, not the process that serves it. nginx decides:
+
+```nginx
+location ^~ /api/notifications           { proxy_pass $notifications_upstream; }
+location ^~ /api/provider/wallet         { proxy_pass $payments_upstream; }
+location ^~ /api/customer/transactions   { proxy_pass $payments_upstream; }
+location ^~ /api/payments/webhook        { proxy_pass $payments_upstream; }
+location /                               { proxy_pass $monolith_upstream; }
+```
+
+That is also why the mobile app in the brief does not change: it calls `localhost:3000` as before.
+
+### Alternatives rejected
+
+| Alternative | Why rejected |
+|---|---|
+| Move only the code, keep the tables in the monolith | Two writers and a shared schema are not a boundary; the monolith could still join across contexts |
+| Synchronous RPC for every notification | A notification outage would fail bookings; the notification is not part of the booking transaction |
+| Let Payments write `orders.payment_status` directly | Distributed-monolith anti-pattern: two services sharing one table is not an extraction |
+| Extract Catalog first | Read-heavy and low-risk, but it exercises no money, idempotency or async boundary |
+| One shared PostgreSQL database with two schemas | Still one failure domain and one migration owner; separate databases make the ownership physical |
+
+### Area A tradeoffs
+
+- Two more services and two more databases to operate.
+- The notification read path can fail while the monolith is healthy.
+- Wallet and transaction reads depend on Payments; an outage returns `502/503`, not stale local data.
+- Money writes need idempotency and a durable retry path (Area D).
+- The monolith still owns `orders`; the settlement callback is an extra network hop.
+
+**Evidence:** `scripts/verify-area-a.ps1` (**32/32 assertions**) and
+`scripts/beat1-happy-path.sh` (**12/12**). The verification script also asserts that both moved table
+sets are absent from the monolith database.
+
+---
+
+## Area B — security
+
+**Claim:** Keycloak is the only issuer, every service verifies the RS256 token itself, ownership is
+enforced where the data lives, and the inherited BOLA is closed.
+
+### Token issuance
 
 | Question | Answer |
 |---|---|
-| **Who issues tokens?** | Keycloak 26.0, realm `edemand`, imported from `keycloak/realm-edemand.json` on every clean boot. The monolith never signs a production token. |
-| **What is in the token?** | RS256 access token with `iss=http://localhost:8081/realms/edemand`, `aud` containing `edemand-api`, and two custom claims mapped from Keycloak user attributes: `local_id` (the monolith's numeric user id) and `role` (`customer` / `provider` / `admin`). |
-| **Who verifies it?** | All three processes, independently. The monolith (`lib/http/keycloak.js`), the notifications service (`notifications-service/keycloak.js`) and the payments service (`payments-service/keycloak.js`) fetch the realm JWKS at boot with retries, cache keys by `kid`, and verify signature + issuer + audience + expiry locally. There is no shared signing secret. |
-| **What about ownership?** | The notifications service derives the recipient from the verified token (`local_id`, `role`) and never from a path/query parameter. Mark-read checks `recipient_id`/`recipient_role` and returns 403 for anyone else. |
+| Who issues tokens? | Keycloak 26.0, realm `edemand`, imported from `keycloak/realm-edemand.json` on every clean boot. The monolith never signs a production token. |
+| What is in the token? | RS256 access token with `iss=http://localhost:8081/realms/edemand`, `aud` containing `edemand-api`, plus two custom claims: `local_id` (the monolith's numeric user id) and `role` (`customer` / `provider` / `admin`). |
+| Who verifies it? | All three processes, independently: the monolith (`lib/http/keycloak.js`), Notifications (`notifications-service/keycloak.js`) and Payments (`payments-service/keycloak.js`). Each fetches the realm JWKS at boot with retries, caches keys by `kid`, and verifies signature + issuer + audience + expiry locally. |
+| Is there a shared signing secret? | No. Only public keys are distributed. A compromised service cannot mint a token. |
 
-**Clients in the realm** (all public, password grant enabled, so the demo can request real tokens):
+### The realm's clients
 
 | Client | Purpose |
 |---|---|
-| `edemand-web` | The normal client. Adds the `edemand-api` audience and the `local_id` / `role` claims. |
-| `edemand-short` | Same claims, but a **5-second** access-token lifespan, so the demo can show a genuine Keycloak token that has expired. |
+| `edemand-web` | Normal login client. Adds the `edemand-api` audience and the `local_id` / `role` claims. |
+| `edemand-short` | Same claims, **5-second** access-token lifespan, so the demo can show a genuine expired Keycloak token. |
 | `edemand-other` | A valid client whose tokens deliberately **omit** the `edemand-api` audience. |
 | `edemand-api` | Bearer-only audience/resource identifier. |
 
-**Login and registration.** `POST /api/auth/{customer,provider,admin}/login` still takes
-`{email, password}` and still returns `{token}` plus the httpOnly `edemand_token` cookie, but the
-monolith now forwards the credentials to Keycloak (password grant on `edemand-web`) and returns
-Keycloak's access token. Registration inserts the local row and provisions the matching Keycloak
-user through the Admin API with `local_id`, `role`, first/last name, and the password; if
-provisioning fails, a compensating delete removes the local row (or the orphaned Keycloak user).
-`JWT_SECRET` is used only by the isolated `node:test` suite, which has no Keycloak.
+### Verification at three processes
 
-**Three negative cases — 401 at both boundaries.** Because verification happens twice, each attack
-is rejected by the monolith and again by the extracted service when the gateway forwards directly to
-it:
-
-| Token | Why it is rejected |
-|---|---|
-| Forged | Signature does not match any realm key → 401 |
-| Expired | `exp` is in the past (the 5-second `edemand-short` token) → 401 |
-| Wrong audience | Validly signed by Keycloak, but `aud` does not include `edemand-api` → 401 |
-
-**The inherited object-level authorization flaw and its fix.** `GET /api/jobs/{id}` accepted any
-authenticated caller and returned any job. The policy is now: the owning customer always; an admin
-always; a provider while the job is `open` (it is a marketplace listing) or if that provider
-actually bid; everyone else `403`. The fix is one guard in
-`lib/modules/bidding/service.js#getJob`, with regression tests in `test/bidding.test.js` covering a
-stranger customer, a non-bidding provider on a booked job, the owner, and a bidding provider.
-
-Run the whole Area B proof (real token, forged, expired, wrong audience, service-side ownership, and
-the BOLA attack before/after semantics):
-
-```bash
-bash scripts/beat3-auth-rejection.sh
+```text
+client token
+   |
+   +--> monolith:       fetch JWKS, verify signature/iss/aud/exp, map to local_id
+   +--> notifications:  fetch JWKS, verify signature/iss/aud/exp
+   +--> payments:       fetch JWKS, verify signature/iss/aud/exp
 ```
 
-Expected: every check passes, including
+No service trusts `x-user-id` or `x-role` from nginx. nginx forwards `Authorization`; it does not
+authenticate. **The service is the security boundary.**
 
-```
-PASS  the extracted service verifies the same token itself
-PASS  extracted service rejects a forged signature
-PASS  extracted service rejects a token for the wrong audience
-PASS  extracted service rejects an expired token
-PASS  another user cannot mark Glow's notification read
-PASS  an unrelated customer cannot read the job (was 200 before the fix)
+The monolith keeps a test-only HS256 path because `node --test` has no Keycloak. It is selected in
+one place (`lib/config.js`) and is disabled whenever `KEYCLOAK_URL` is set. It is a test seam, not a
+production fallback.
+
+### Rejection matrix
+
+| Case | Monolith | Extracted services | Status |
+|---|---|---|---|
+| Real Keycloak token | Accept | Accept | 200 |
+| Forged signature | Reject | Reject | **401** |
+| Wrong audience | Reject | Reject | **401** |
+| Expired token | Reject | Reject | **401** |
+| No token | Reject | Reject | **401** |
+| Valid token, wrong owner | Reject | Reject | **403** |
+
+The sentence to remember: **401 is about the token; 403 is about the object.**
+
+### Ownership
+
+- **Notifications:** the query uses `recipient_role` and `recipient_id` from the verified token. The
+  caller cannot pass another user's id in a query string. Mark-read returns `403` for someone else's
+  row.
+- **Payments:** the wallet query uses the provider id from the verified token. A customer token gets
+  `403` on the provider wallet.
+- **Jobs:** the inherited BOLA is fixed (below).
+
+### The inherited BOLA, before and after
+
+The supplied monolith let any authenticated caller read any job by id:
+
+```text
+GET /api/jobs/{id} with any valid token -> 200 + full job body
 ```
 
-### Area C — events on RabbitMQ, duplicate delivery, and a saga
+The fix is one ownership policy in `lib/modules/bidding/service.js#getJob`:
+
+```text
+unrelated customer          -> 403
+job owner (customer)        -> 200
+assigned provider           -> 200
+admin                       -> 200
+provider + open job         -> 200   (marketplace listing)
+provider who actually bid   -> 200
+```
+
+The UI hiding the button was never the control. The attacker changes the id, not the token, so the
+check must live in the route/service that reads the object. Regression tests in
+`test/bidding.test.js` cover the stranger, the non-bidding provider on a booked job, the owner, and a
+bidding provider.
+
+### Internal boundaries
+
+- `/api/internal/*`, `/internal/*` and `/metrics` return **404 at nginx**.
+- Service-to-service calls use `INTERNAL_API_KEY`.
+- The webhook uses `X-Webhook-Secret` and is idempotent by `gateway_event_id`.
+- The databases publish no host ports.
+
+### Area B limitations
+
+- The internal key is **shared**, not per-service workload identity. At this size it is proportionate;
+  production would add a private network and mTLS/workload identity.
+- There is no token revocation list. A stolen token works until `exp`; production would use
+  short-lived access tokens, refresh tokens and session logout.
+- The realm is imported from a committed JSON file and the demo issuer is a plain HTTP hostname.
+  Production needs TLS and a stable issuer URL.
+
+**Evidence:** `scripts/beat3-auth-rejection.sh` (**17/17 assertions**), including
+`iss=http://localhost:8081/realms/edemand`, `aud=edemand-api`, both boundaries rejecting forged,
+wrong-audience and expired tokens, the ownership check, and the BOLA before/after behaviour.
+
+---
+
+## Area C — events, duplicate delivery, and the saga
 
 | The four boundary questions | Answer |
 |---|---|
 | **What crosses** | Domain **events**, not commands: `provider.approved`, `provider.approval_reverted`, `booking.status_changed`, `booking.completed`, `review.created`, `bid.accepted`, `payment.succeeded`. The message is the raw event (`event_uid`, `type`, `aggregate_*`, `payload`, `occurred_at`). |
-| **Ownership** | The monolith owns the outbox (`events`) and the saga table (`sagas`). The Notifications service owns the event → notification projection (`notification-rules.cjs`) and its PostgreSQL rows. |
-| **Transport** | RabbitMQ topic exchange `edemand.events`; durable queues `edemand.notifications` (consumer: Notifications) and `edemand.sagas` (consumer: the orchestrator). Publisher confirms; at-least-once delivery. |
-| **Decision** | Publish from the outbox in the same transaction as the state change, then let each consumer own its projection. Provider approval is the cross-service workflow, run as an **orchestrated saga**. |
+| **Ownership** | The monolith owns the outbox (`events`) and the saga table (`sagas`). Notifications owns the event → notification projection (`notification-rules.cjs`) and its rows. |
+| **Transport** | RabbitMQ topic exchange `edemand.events`; durable queues `edemand.notifications` (Notifications) and `edemand.sagas` (orchestrator). Publisher confirms; at-least-once delivery. |
+| **Decision** | Publish from the outbox in the same transaction as the state change, then let each consumer own its projection. Provider approval runs as an **orchestrated saga**. |
 
-**Outbox, not dual writes.** `approveProvider`, every booking transition, `review.created`, bid
-acceptance and payment settlement insert their `events` row inside the same SQLite transaction as
-the state change. Either both commit or neither does. The in-process relay (`setInterval` in
-`instrumentation.js`) claims a row, publishes it to `edemand.events`, and only then stamps
-`processed_at`. If the broker is down the claim is released and the next pass retries. This is the
-transactional-outbox pattern, not “write the DB then publish and hope”.
+### Outbox, not dual writes
 
-**Duplicate delivery still has one effect.** Delivery is at-least-once by design: a broker can
-redeliver after a crash, and the relay can republish after a failed confirm. The Notifications
-service inserts with a unique key `(source_event_id, recipient_role, recipient_id, type)` and
-`ON CONFLICT DO NOTHING`, where `source_event_id` is the outbox UUID. A duplicate message therefore
-creates **no second row**. The saga outcomes use the same trick: `notification.created` /
-`notification.failed` are handled by conditional `UPDATE ... WHERE state='awaiting_notification'`,
-so a duplicate outcome cannot finish or compensate a saga twice.
+Every state change inserts an `events` row **inside the same SQLite transaction** as the write. Either
+both commit or neither does. The in-process relay (`setInterval` in `instrumentation.js`) claims a
+row, publishes it to `edemand.events`, and only then stamps `processed_at`. If the broker is down,
+the claim is released and the next pass retries. This is the transactional-outbox pattern, not
+"write the DB, then publish and hope".
 
-**Two events are demonstrated.** `provider.approved` is the event that drives the saga below.
-`booking.status_changed` is the ordinary event path: placing a booking writes it, the relay publishes
-it, and the projection notifies the counterparty. Both are proven on the live stack and in
-`test/area-c-events.test.js`.
+### Duplicate delivery still has one effect
 
-**The saga: provider approval.** Approving a provider has a local step (set `is_approved`) and a
-remote step (create the welcome notification in another service/database). The sequence is:
+Delivery is at-least-once by design: a broker can redeliver after a crash, and the relay can
+republish after a failed confirm. Notifications inserts with
+`UNIQUE (source_event_id, recipient_role, recipient_id, type)` and `ON CONFLICT DO NOTHING`, where
+`source_event_id` is the outbox UUID. A duplicate message creates **no second row**.
 
-1. **local** — in one SQLite transaction: flip `is_approved`, insert the `sagas` row
-   (`awaiting_notification`), insert `provider.approved` with its `saga_id` in the payload;
-2. **remote** — Notifications consumes the event, writes the notification idempotently, and
-   publishes `notification.created` (or `notification.failed`);
-3. **local** — the orchestrator consumes the outcome: `notification.created` moves the saga to
-   `completed`; `notification.failed` runs the **compensating action**, which unapproves the provider
-   and writes `provider.approval_reverted` in the same transaction as `state='compensated'`.
+Saga outcomes use the same trick: `notification.created` / `notification.failed` are handled by
+conditional `UPDATE ... WHERE state='awaiting_notification'`, so a duplicate outcome cannot finish or
+compensate a saga twice.
 
-The admin can follow the workflow at `GET /api/admin/sagas/{id}` (and list it at
-`GET /api/admin/sagas`). A failed approval can be retried; a retry is a fresh saga.
+### The projection rules
 
-**Why orchestration, not choreography.** The approval is one admin action with a clear owner, a
-short fixed sequence (two steps), and exactly one compensating action. Putting that sequence in one
-place makes it easy to read, test and operate: the monolith can answer “what happened to this
-approval?” from one `sagas` row, and the remote participant stays dumb — it only reports whether the
-notification was created. Choreography would spread the sequence across Notifications (which would
-have to know that its failure means “unapprove”) and make ownership of the compensation ambiguous.
-Choreography is the better fit for long, loosely-coupled, many-consumer flows; a two-step onboarding
-with one owner is not that.
+`notifications-service/notification-rules.cjs` is the whole event → notification mapping:
 
-**Deterministic failure demo.** `POST /internal/faults` on the Notifications service (shared internal
-key, never routed through the gateway) turns on `notification_failure`. The consumer then publishes
-`notification.failed` instead of writing a row, which triggers the real compensation. The switch is
-in-memory and resets on restart.
+| Event | Recipient | Type | Copy |
+|---|---|---|---|
+| `booking.status_changed` | **counterparty** of the actor | `booking_status` | `Booking #<id> is now <status>.` |
+| `booking.completed` | customer | `rating_request` | `How did it go?` |
+| `review.created` | provider | `new_review` | `You received a <n>-star review.` |
+| `provider.approved` | provider | `provider_approved` | `You're approved` |
+| `provider.approval_reverted` | provider | `provider_approval_reverted` | `Approval reverted` |
+| `bid.accepted` | winner + losers | `bid_accepted` / `bid_rejected` | Bid outcome |
+| `payment.succeeded` | provider | `payment_received` | `Payment of <n> cents was received.` |
+
+This is why **creating a booking does not notify the customer**: the customer is the actor, so the
+rule notifies the counterparty (the provider). The customer's rows appear when the provider drives
+the next state change.
+
+### The saga: provider approval
+
+Approving a provider has a local step (set `is_approved`) and a remote step (create the welcome
+notification in another service and database).
+
+1. **Local** — one SQLite transaction: flip `is_approved`, insert the `sagas` row
+   (`awaiting_notification`), insert `provider.approved` with its `saga_id`.
+2. **Remote** — Notifications consumes the event, writes the notification idempotently, publishes
+   `notification.created` (or `notification.failed`).
+3. **Local** — the orchestrator consumes the outcome. `notification.created` moves the saga to
+   `completed`. `notification.failed` runs the **compensating action**: unapprove the provider and
+   write `provider.approval_reverted` in the same transaction as `state='compensated'`.
+
+Admins can follow it at `GET /api/admin/sagas/{id}` and list it at `GET /api/admin/sagas`.
+
+**Why orchestration, not choreography.** The flow is one admin action, one owner, two steps and one
+compensation. One place to read and test. Choreography would spread the sequence across Notifications
+— which would then have to know that its failure means "unapprove" — and make ownership of the
+compensation ambiguous. Choreography is better for long, loosely-coupled, many-consumer flows.
+
+**Deterministic failure demo.** `POST /internal/faults` on Notifications (internal key, never routed)
+turns on `notification_failure`. The consumer then publishes `notification.failed`, triggering the
+real compensation. The switch is in-memory and resets on restart.
 
 ```bash
 bash scripts/verify-area-c.sh
 ```
 
-Expected (after `docker compose up -d --build --wait`):
+Expected: `AREA C PASSED (18 assertions)`, including one row per `source_event_id`, a re-published
+event creating no second row, compensation unapproving Glow, and a retry completing the saga.
 
-```
-PASS  notifications queue exists on RabbitMQ
-PASS  Notifications service is consuming edemand.notifications (1 consumer)
-PASS  topic exchange exists
-PASS  approval returned saga <uuid>
-PASS  saga <uuid> completed after notification.created
-PASS  the relay published event <uuid> to RabbitMQ (outbox row processed)
-PASS  re-publishing the same event created no second notification
-PASS  PostgreSQL holds exactly one row for source_event_id <uuid>
-PASS  booking.status_changed was published from the outbox
-PASS  FixIt received exactly one booking_status notification for order ...
-PASS  notification.failed compensated saga <uuid>
-PASS  compensating action unapproved Glow
-PASS  Glow received provider_approval_reverted
-PASS  retry completed the saga and Glow is approved again
-AREA C PASSED (18 assertions)
-```
-
-**Reset.** `docker compose down -v` drops both the notifications PostgreSQL volume and the RabbitMQ
-volume. RabbitMQ also recreates the exchange/queues from the assert-on-boot code, so the topology is
-deterministic. The broker is not a second source of truth: the outbox is.
+**Reset.** `docker compose down -v` drops the notifications and RabbitMQ volumes. RabbitMQ recreates
+the exchange and queues from the assert-on-boot code. The broker is not a second source of truth: the
+outbox is.
 
 ---
 
-### Area D — timeouts, retries, idempotency, and one repaired race
+## Area D — timeouts, retries, idempotency, and one repaired race
 
 Area D makes the **monolith → Payments & Wallet** seam survive the three failures the brief names.
 The seam is used by booking completion (payout/commission) and cancellation (refund); the demo uses
@@ -418,11 +716,13 @@ completion because it changes money and is easy to observe.
 
 | Injected failure | What happens at the seam | Why the caller survives |
 |---|---|---|
-| **Reply lost after the write** (`lost_reply`) | Payments commits the ledger row and the idempotency record, then destroys the socket before the response is written. | The client sees a transport error, backs off and retries with the **same** `Idempotency-Key`. Payments finds the stored response and replays it. One effect. |
-| **Reply slower than the timeout** (`slow_reply_ms`) | Payments commits, then holds the response past the client's 3s timeout. | The client times out, retries with the same key; the stored response is returned immediately. The first, late response writes to a dead socket and is ignored. One effect. |
-| **Service unavailable for a window** (`outage_ms`) | Every request fails with 503 before any write. | The order commit is already durable and includes a `ledger_commands` row. The response does not fail; the background reconciler replays the command after the outage ends. One effect. |
+| **Reply lost after the write** (`lost_reply`) | Payments commits the ledger row and the idempotency record, then destroys the socket before the response is written | The client sees a transport error, backs off and retries with the **same** `Idempotency-Key`. Payments finds the stored response and replays it. One effect. |
+| **Reply slower than the timeout** (`slow_reply_ms`) | Payments commits, then holds the response past the client's 3 s timeout | The client times out and retries with the same key; the stored response returns immediately. The late response writes to a dead socket. One effect. |
+| **Service unavailable for a window** (`outage_ms`) | Every request fails with 503 before any write | The order commit is already durable and includes a `ledger_commands` row. The response does not fail; the background reconciler replays the command after the outage. One effect. |
 
-**Timeout + retry + jitter** live in `lib/modules/payments/client.js`:
+### Timeout, retry, jitter
+
+`lib/modules/payments/client.js`:
 
 ```js
 AbortSignal.timeout(config.paymentsTimeoutMs)              // 3000 ms
@@ -430,127 +730,144 @@ config.paymentsMaxAttempts                                  // 3 attempts
 delay = random() * min(4000, 250 * 2^(attempt-1))           // exponential, full jitter
 ```
 
-Only transport failures, timeouts and 5xx are retried; a 4xx is a decision and escapes at once.
-Full jitter is deliberate: a fleet that retries in lockstep after an outage creates the next
-outage. Jitter spreads the retries over the backoff window.
+Only transport failures, timeouts and 5xx are retried. A 4xx is a decision and escapes at once.
 
-**Two layers of idempotency, on purpose.**
+Full jitter is deliberate: a fleet that retries in lockstep after an outage creates the next outage.
+Jitter spreads the retries across the backoff window.
 
-1. *Transport* — every logical write gets one key (`payment-intent:<order>`,
-   `booking-completed:<order>`, `webhook:<gateway_event_id>`, …). Payments stores it in
-   `idempotency_keys(key PRIMARY KEY)` together with the response and returns that response on a
-   replay. Retries and reconciliation attempts are therefore observed once.
-2. *Domain* — the money tables keep their own UNIQUE keys: `payment_intents.order_id`,
-   `transactions(order_id, kind)` and `webhook_events.gateway_event_id`. Even two different keys
-   that race cannot double-credit, because the database refuses the second row.
+### Two layers of idempotency, on purpose
 
-**Durability before the network call.** Completing or cancelling a booking writes the order change,
-the outbox event and a `ledger_commands` row in the **same SQLite transaction**
-(`lib/modules/booking/service.js`, `lib/modules/payments/ledger-queue.js`). The direct HTTP call is
-only the low-latency path; if it fails, the row stays pending and
-`startLedgerReconciler()` (started in `instrumentation.js`) retries it every 3 seconds until the
-payments service acknowledges it. A payments outage delays the wallet update but cannot lose it.
+1. **Transport** — every logical write gets one key (`payment-intent:<order>`,
+   `booking-completed:<order>`, `webhook:<gateway_event_id>`). Payments stores it in
+   `idempotency_keys(key PRIMARY KEY)` with the response and returns that response on a replay.
+2. **Domain** — the money tables keep their own UNIQUE keys: `payment_intents.order_id`,
+   `transactions(order_id, kind)` and `webhook_events.gateway_event_id`. Even two different keys that
+   race cannot double-credit, because the database refuses the second row.
 
-**The unsafe race that was fixed.** Registering a customer or provider was a read-then-write:
-`findCustomerByEmail()` followed by `INSERT`. Two requests arriving together both read “no such
-email”, both insert, and the UNIQUE(email) index rejects the second — but the raw
-`SQLITE_CONSTRAINT_UNIQUE` became a **500** instead of the 409 the sequential path returns.
-The fix in `lib/modules/identity/repository.js` lets the index be the arbiter and translates the
-constraint into `ConflictError` (409). It is proven by `test/identity-race.test.js`, which opens two
-worker threads on the same file database, holds `BEGIN IMMEDIATE` while both pass the advisory
-check, then releases the lock: exactly one registration wins, the other is a clean 409, and one row
-exists. The test was run with the translation disabled to confirm it fails with the raw SQLite
-error before the fix.
+### Durability before the network call
 
-**Proof.** `scripts/beat2-failure-recovery.sh` arms each switch through the internal-only control
-endpoint, completes a real booking, and asserts the order stays completed, the wallet has exactly
-one ledger row for that order, and the durable command is marked done. It passes 20 assertions on
-a clean boot. The race proof is part of `npm test` and CI.
+Completing or cancelling a booking writes the order change, the outbox event and a `ledger_commands`
+row in the **same SQLite transaction** (`lib/modules/booking/service.js`,
+`lib/modules/payments/ledger-queue.js`). The direct HTTP call is only the low-latency path. If it
+fails, the row stays pending and `startLedgerReconciler()` retries every 3 seconds until Payments
+acknowledges it. An outage delays the wallet update but cannot lose it.
 
-**Tradeoff accepted.** The reconciler is in-process and polls every 3 seconds, so a recovery is
-“seconds, not milliseconds”, and a total monolith outage pauses reconciliation until it restarts.
-The alternative — a separate queue worker/CDC — is more moving parts than a two-step money write
-needs at this size. What matters is that the command is durable first and retried later, not that
-the retry is instantaneous.
+### The unsafe race that was fixed
 
-### Area E — traces, metrics, dashboard, and contract tests
+Registration was a read-then-write: `findCustomerByEmail()` followed by `INSERT`. Two concurrent
+requests both read "no such email", both insert, and the UNIQUE(email) index rejects the second — but
+the raw `SQLITE_CONSTRAINT_UNIQUE` became a **500** instead of the clean **409** of the sequential
+path.
 
-**One trace across both seams.** OpenTelemetry is wired in all three processes:
+The fix lets the index be the arbiter and translates the constraint into `ConflictError` (409).
+`test/identity-race.test.js` proves it with two worker threads on the same file database: one 201,
+one 409, one row. The test was also run with the translation disabled to confirm it fails before the
+fix.
 
-- `lib/telemetry.js`, `payments-service/telemetry.js`, `notifications-service/telemetry.js`
+**Evidence:** `scripts/beat2-failure-recovery.sh` (**20/20 assertions**) on a clean boot. Recovery
+times observed: lost reply **162 ms**, slow reply **3230 ms**, 9 s outage **616 ms** — in every case
+the order stayed completed and Payments held exactly one ledger row.
+
+**Accepted tradeoff:** the reconciler is in-process and polls every 3 seconds, so recovery is
+"seconds, not milliseconds", and a total monolith outage pauses reconciliation until restart. The
+alternative — a separate queue worker or CDC — is more moving parts than a two-step money write needs
+at this size. What matters is that the command is durable first and retried later.
+
+---
+
+## Area E — traces, metrics, dashboard, and contract tests
+
+### One trace across both seams
+
+OpenTelemetry runs in all three processes (`lib/telemetry.js`, `payments-service/telemetry.js`,
+`notifications-service/telemetry.js`):
+
 - the monolith starts a SERVER span in `lib/http/handle.js` and returns `x-trace-id` plus a W3C
   `traceparent` header;
-- the payments client injects the current `traceparent` on every outbound HTTP call, so the
-  payments SERVER span is a child of the monolith route span;
-- `events.trace_parent` stores the trace of the request that wrote the outbox row. The relay starts
-  a PRODUCER span parented to it, and `lib/messaging/rabbit.js` puts that `traceparent` in the
-  RabbitMQ message headers;
-- the notifications consumer starts a CONSUMER span from the header, and carries the trace into
+- the payments client injects the current `traceparent` on every outbound HTTP call, so the Payments
+  SERVER span is a child of the monolith route span;
+- `events.trace_parent` stores the trace of the request that wrote the outbox row. The relay starts a
+  PRODUCER span parented to it, and `lib/messaging/rabbit.js` puts that `traceparent` in the RabbitMQ
+  message headers;
+- the Notifications consumer starts a CONSUMER span from the header and carries the trace into
   `notification.created` / `notification.failed`; the monolith's saga consumer continues it.
 
-The result is visible in Jaeger: one trace containing `POST /api/bookings` (edemand),
-`POST /internal/payment-intents` (payments), `publish booking.status_changed` (edemand) and
-`process booking.status_changed` (notifications). `scripts/beat4-find-the-trace.sh` asserts the
-three services are present and that every child span points at a parent in the same trace.
+Result in Jaeger: one trace containing the monolith route, the payments HTTP call, the outbox publish
+and the notifications consumer. `scripts/beat4-find-the-trace.sh` asserts all three services appear
+and that **every child span points at a parent in the same trace** (`ORPHANS=0`).
 
 Tracing is **off unless `OTEL_EXPORTER_OTLP_ENDPOINT` is set**, so `node --test` and a bare
-`npm run dev` do not emit spans. Compose points all three services at `http://jaeger:4318`; the UI
-is `http://localhost:16686`.
+`npm run dev` emit nothing. Compose points all three at `http://jaeger:4318`.
 
-**Metrics and dashboard.** Each service exposes `/metrics` in Prometheus format. `nginx` returns
-404 for `/metrics` and `/internal`, so they are reachable only on the compose network. The shared
-metric names are:
+### Metrics and dashboard
+
+Each service exposes `/metrics` in Prometheus format. nginx returns 404 for `/metrics` and
+`/internal`, so they are reachable only on the compose network.
 
 | Metric | Labels | Used for |
 |---|---|---|
-| `http_requests_total` | `service`, `method`, `route`, `status` | request rate and 5xx ratio |
+| `http_requests_total` | `service`, `method`, `route`, `status` | Request rate and 5xx ratio |
 | `http_request_duration_seconds` | `service`, `method`, `route`, `status` | p95 response time |
-| `notifications_events_projected_total` | `service`, `event_type`, `outcome` | consumer progress and injected failures |
+| `notifications_events_projected_total` | `service`, `event_type`, `outcome` | Consumer progress and injected failures |
 
 Route labels are normalised (`/api/bookings/8001` → `/api/bookings/:id`), so ids do not explode the
-time-series count. Prometheus scrapes all three targets every 5s; Grafana is provisioned from
-`observability/` with one dashboard, **eDemand — services at a glance**, containing request rate,
-error rate and p95 latency per service. Open `http://localhost:3005`.
+time-series count. Prometheus scrapes all three targets every 5 s. Grafana is provisioned from
+`observability/` with one dashboard, **eDemand — services at a glance**: request rate, error rate and
+p95 latency per service.
 
-**Contract tests.** Pact consumer tests live in `test/pact/`:
+### Contract tests
 
-- `notifications.pact.test.js` drives the real monolith client against a Pact mock and pins the
-  inbox response shape and the forwarded bearer token;
-- `payments.pact.test.js` pins `POST /internal/payment-intents` (including the
-  `Idempotency-Key` header) and `GET /api/provider/wallet`.
+Pact consumer tests live in `test/pact/`:
 
-They write `pacts/edemand-monolith-{notifications,payments}-service.json`. Run them with
-`npm run test:pact`. `.github/workflows/ci.yml` runs the unit suite, the contract job and a
-production build; the contract job was executed locally with:
+- `notifications.pact.test.js` drives the real monolith client against a Pact mock and pins the inbox
+  response shape and the forwarded bearer token;
+- `payments.pact.test.js` pins `POST /internal/payment-intents` (including the `Idempotency-Key`
+  header) and `GET /api/provider/wallet`.
+
+They write `pacts/edemand-monolith-{notifications,payments}-service.json`. Run with
+`npm run test:pact` (2/2).
+
+`.github/workflows/ci.yml` runs the unit suite, the contract job and a production build. The contract
+job was executed locally with:
 
 ```bash
 act pull_request -j contracts
 ```
 
-`act` does not provide GitHub's artifact service, so the upload step is guarded with
-`if: ${{ env.ACT != 'true' }}`; the job still fails the run if a contract breaks.
+`act` has no GitHub artifact service, so the upload step is guarded with `if: ${{ env.ACT != 'true' }}`;
+the job still fails the run if a contract breaks.
+
+**Evidence:** `scripts/beat4-find-the-trace.sh` (**12/12**, 9 spans, `ORPHANS=0`),
+`npm run test:pact` (**2/2**), and the CI workflow above.
 
 ---
 
-## Demo scripts — the four beats
+## The four demo beats
 
-Run them in order on a clean boot (`docker compose down -v && docker compose up -d --build --wait`).
-Each script waits for health, prints one `PASS` line per assertion, and exits non-zero on a
-mismatch. They use only `curl`, `node` and the compose stack.
+Run them from the repository root on a clean boot:
 
-### 1. `scripts/beat1-happy-path.sh`
+```bash
+docker compose down -v
+docker compose up -d --build --wait
+```
 
-One request path across every boundary: the notifications service refuses an anonymous call, admin
-approval drives the saga and the RabbitMQ projection, a gateway booking creates a payment intent,
-“Pay now” settles it, and OTP completion writes one payout row in Payments.
+Each script waits for health, prints one `PASS` line per assertion, and exits non-zero on a mismatch.
+They use only `curl`, `node` and the compose stack.
+
+> **Windows:** prefix with Git Bash, e.g.
+> `& "C:\Program Files\Git\bin\bash.exe" scripts/beat1-happy-path.sh`.
+
+### 1. Happy path — `scripts/beat1-happy-path.sh`
+
+One request path across every boundary: anonymous inbox rejected by Notifications, admin approval
+drives the saga and the RabbitMQ projection, a gateway booking creates a payment intent, "Pay now"
+settles it, and OTP completion writes one payout row in Payments.
 
 ```bash
 bash scripts/beat1-happy-path.sh
 ```
 
-Expected (ids differ per boot):
-
-```
+```text
 PASS  stack healthy at http://localhost:3000/api/health
 PASS  unauthenticated inbox is 401 at the service
 PASS  401 body came from the notifications service, not the monolith
@@ -567,21 +884,16 @@ PASS  the wallet row carries the order's provider earnings (109140 cents)
 BEAT 1 PASSED (12 assertions)
 ```
 
-On a second run without a reset, Glow is already approved; the script says so and still proves the
-inbox and the remaining beats.
-
-### 2. `scripts/beat2-failure-recovery.sh`
+### 2. Failure recovery — `scripts/beat2-failure-recovery.sh`
 
 The three Area D failures, each survived with exactly one wallet effect. The switches are internal
-and reset automatically when the script exits.
+and reset when the script exits.
 
 ```bash
 bash scripts/beat2-failure-recovery.sh
 ```
 
-Expected:
-
-```
+```text
 == lost reply after the write: order 8002 ==
 PASS  completion survived 'lost reply after the write' (HTTP 200 after 162ms)
 PASS  order 8002 is completed, not rolled back
@@ -601,19 +913,17 @@ BEAT 2 PASSED (20 assertions)
 One order, one wallet effect, in every failure mode.
 ```
 
-### 3. `scripts/beat3-auth-rejection.sh`
+### 3. Auth rejection — `scripts/beat3-auth-rejection.sh`
 
-Real Keycloak token accepted by both boundaries; forged, expired and wrong-audience tokens rejected
+A real Keycloak token accepted by both boundaries; forged, expired and wrong-audience tokens rejected
 with 401 by the monolith **and** the extracted services; ownership enforced; and the inherited
-`GET /api/jobs/{id}` BOLA attack returns 403 where it used to return 200.
+`GET /api/jobs/{id}` BOLA now returning 403 where it used to return 200.
 
 ```bash
 bash scripts/beat3-auth-rejection.sh
 ```
 
-Expected:
-
-```
+```text
 PASS  token issuer is Keycloak
 PASS  the monolith accepts the real token
 PASS  the extracted service verifies the same token itself
@@ -630,18 +940,15 @@ PASS  the owner still reads the job
 AREA B PASSED (17 assertions)
 ```
 
-### 4. `scripts/beat4-find-the-trace.sh`
+### 4. Find the trace — `scripts/beat4-find-the-trace.sh`
 
 Makes one gateway booking and finds the same request in Jaeger after the asynchronous half has run.
-A marker can open the printed URL and see all three services in one trace.
 
 ```bash
 bash scripts/beat4-find-the-trace.sh
 ```
 
-Expected:
-
-```
+```text
 PASS  response carries a 32-hex x-trace-id (<trace-id>)
 PASS  the same response carries a W3C traceparent (00-<trace-id>-<span-id>-01)
 PASS  the monolith contributed spans
@@ -661,138 +968,206 @@ Open the trace: http://localhost:16686/trace/<trace-id>
 Grafana (request rate, error rate, p95 latency per service): http://localhost:3005
 ```
 
-**Reset between runs.** `docker compose down -v` is the canonical first boot: it drops
-`notifications-db-data`, `payments-db-data`, `rabbitmq-data` and `grafana-data`. The monolith reseeds
-SQLite on every start, so booking ids return to 8001.
+---
+
+## Verification matrix
+
+Every number below comes from the submitted tag on a clean boot.
+
+| Check | Command | Expected |
+|---|---|---|
+| Full test suite | `docker compose run --rm test` | **78/78** pass |
+| Unit/concurrency only | `npm run test:unit` (Node 20) | **76/76** pass |
+| Pact contracts | `npm run test:pact` | **2/2** pass |
+| Production build | `npm run build` | Success |
+| Clean boot | `docker compose up -d --build --wait` | **11 running, 9 healthy** |
+| Area A verification | `powershell -ExecutionPolicy Bypass -File scripts/verify-area-a.ps1` | **32/32** |
+| Area C verification | `bash scripts/verify-area-c.sh` | **18/18** |
+| Beat 1 — happy path | `bash scripts/beat1-happy-path.sh` | **12/12** |
+| Beat 2 — failure recovery | `bash scripts/beat2-failure-recovery.sh` | **20/20** |
+| Beat 3 — auth rejection | `bash scripts/beat3-auth-rejection.sh` | **17/17** |
+| Beat 4 — trace | `bash scripts/beat4-find-the-trace.sh` | **12/12**, 9 spans, `ORPHANS=0` |
+
+The suite covers: health; identity (401/403/400/409); catalog (pagination, ownership); booking (id
+8001, slot double-book race, idempotency, full status machine, OTP completion with exactly-once
+credit, cancel/refund, reschedule); slots; bidding (accept race, accept-vs-withdraw); the payments
+webhook replay; reviews → outbox → relay rating aggregate; admin approval writing the outbox event
+atomically; Area C events (duplicate delivery, saga completion, compensation, retry); the identity
+race with two worker threads; and the two Pact contracts.
+
+The broker is not started by `node:test`. `test-helpers/notifications.js` installs an in-process
+publisher that runs the **same** projection rules as the service. RabbitMQ, real queues and duplicate
+redelivery are proven by `scripts/verify-area-c.sh` on the compose stack.
 
 ---
 
-## Seam analysis — what extracts first, and why
+## Troubleshooting
 
-The boundaries are drawn so a context can be lifted into its own service with a known, small set of
-cross-context calls to replace with network calls. Ranked by *how cleanly it detaches today*:
+| Symptom | Cause | Fix |
+|---|---|---|
+| `execvpe(/bin/bash) failed: No such file or directory` | PowerShell's `bash` is WSL, and the distro has no `/bin/bash` | Use `& "C:\Program Files\Git\bin\bash.exe" scripts/beat1-happy-path.sh` |
+| `better-sqlite3` build error on `npm install` | Node 24 has no prebuilt binary; building needs Visual Studio C++ tools | Use Node 20 (`.nvmrc`) or run tests in Docker |
+| `docker compose up --wait` times out on first boot | Keycloak imports the realm and both services wait for JWKS; first boot is 2–4 minutes | Wait, then `docker compose ps`; inspect `docker compose logs keycloak notifications` |
+| `bind: address already in use` on 3000/8081/15672 | Another Docker project or local service owns the port | `docker compose down` in the other project, or change the host side of the mapping |
+| `502 Bad Gateway` on `/api/notifications` or wallet | The extracted service is unhealthy, or Keycloak is not ready | `docker compose ps`; `docker compose logs notifications payments` |
+| Login returns 401 immediately after boot | Realm import or JWKS fetch not finished | Wait ~60 s for the first Keycloak import, then retry |
+| Notifications page is empty after *creating* a booking | The customer is the actor, so the rule notifies the **provider** | Log in as `sparkle@example.com` to see it; customer rows appear when the provider confirms/starts/completes |
+| Jaeger shows nothing | Traces export asynchronously | Wait a few seconds, reload; Beat 4 retries before asserting |
+| Grafana panels are empty | Prometheus has not scraped yet (5 s interval) | Wait ~15 s and refresh |
+| `permission denied` running a beat | Script not executable / wrong shell | Run with `bash scripts/...`, not `./scripts/...` |
+| Beat 1 says Glow is already approved | Stack was not reset, so the saga already ran | `docker compose down -v && docker compose up -d --build --wait` |
 
-1. **Notifications (extract first — done in Area A).** It already behaved like a separate service:
-   one owned table, no synchronous hot-path caller. It now runs as an Express service with its own
-   PostgreSQL DB behind the gateway. **Area C closed the remaining coupling**: the relay publishes
-   raw domain events to RabbitMQ, and the service owns the event → notification projection. The
-   service's `source_event_id` dedupe still assumes at-least-once delivery.
-   Lowest-risk, highest-teaching-value first cut.
-2. **Payments & Wallet (extract second).** The webhook is already an async, idempotent,
-   secret-authenticated boundary — exactly what a payments service exposes. Its one inward coupling is
-   writing `orders.payment_status='paid'` at settlement (a Booking-owned column). That single
-   cross-context write becomes a `booking.mark_paid` call or a `payment.succeeded` event Booking
-   subscribes to. Clear seam, one wire to cut.
-3. **Catalog / Provider Profile (extract together).** Read-heavy, mostly independent. The catch is
-   the rating aggregate on `services`/`provider_profiles` is recomputed by the **relay** on
-   `review.created` — so extraction means Catalog subscribes to that event instead of sharing the
-   table. The outbox already models this dependency, which is the point.
-4. **Booking + Bidding (extract last / together).** The hardest, because they share the physical
-   double-book guard: **both** the place-booking path and the bid-accept path insert into
-   `slot_holds` (the `UNIQUE(provider_id, service_date, slot_time)` index). In one database that
-   uniqueness is free; split them and the availability/slot-hold invariant becomes a distributed
-   concurrency problem (a reservation service, or sagas). Extract these last, and only once you have a
-   deliberate answer for cross-service slot reservation. Identity is a shared dependency of everything
-   and is best pulled out early as an IdP, but it has no owned business logic worth arguing about.
+Useful commands:
 
----
-
-## The teaching hooks (all real, all tested)
-
-Each is a genuine mechanism, not a stub, and each has a test proving it.
-
-- **Place-booking = ONE transaction** (`booking/service.js#placeBooking`, `test/booking.test.js`).
-  Order + items + `slot_holds` + optional payment intent + outbox event commit or roll back as a
-  single `BEGIN IMMEDIATE` transaction. A slot clash leaves **zero** partial rows.
-- **Slot double-book guard** — `UNIQUE(provider_id, service_date, slot_time)` on `slot_holds`. Two
-  concurrent bookings for the same slot ⇒ **one 201, one 409** (`slot no longer available`). The
-  read-side `get_available_slots` is advisory; the *write* is what makes a double-book physically
-  impossible. (Contrast: the real product does an unguarded read-then-insert — two customers both pass.)
-- **Bid-accept race** (`bidding/service.js#acceptBid`). `UPDATE job_requests SET status='booked'
-  WHERE status='open'` then `UPDATE bids SET status='accepted' WHERE status='pending'` — both
-  conditional. Two concurrent accepts ⇒ exactly one winner; accept-vs-withdraw ⇒ exactly one succeeds.
-  No read-then-write gap.
-- **OTP-gated completion** (`booking/service.js#completeBooking`). The provider closes a job only by
-  entering the **6-digit OTP the customer holds** (proof of presence). The wallet credit lives inside
-  the `UPDATE ... WHERE status='started' AND otp=?` — so a replay (or a second provider) matches zero
-  rows and **the balance is credited exactly once**. Commission split: gateway → provider balance;
-  COD → commission owed to the platform (`total*pct/100`).
-- **Payment-webhook idempotency** (`payments-service/app.js#settleWebhook`). The gateway's
-  `gateway_event_id` is the dedupe key (`webhook_events.gateway_event_id UNIQUE`). A replayed callback
-  short-circuits and credits nothing twice. (Contrast: the real product has no idempotency and
-  double-processes retries.)
-- **Outbox + relay + broker** (`db/events.js`, `notifications/relay.js`, `lib/messaging/rabbit.js`).
-  Every state change writes an `events` row **in the same transaction**. A relay drains it
-  (`setInterval` in `instrumentation.js`, or `runRelayOnce()` in tests), claiming each event via
-  `processed_at` and publishing it to RabbitMQ with publisher confirms. Consumers dedupe on the
-  outbox UUID, so a redelivery has exactly one effect. The live proof is
-  `scripts/verify-area-c.sh`.
-- **Eventual consistency of ratings.** The service/provider rating aggregate is recomputed **in the
-  relay**, driven by `review.created` — *not inline* in the review handler. So a fresh review leaves
-  the aggregate momentarily stale until the relay runs. This is the deliberate contrast with Ride
-  (which updates the aggregate inline) and the whole reason the outbox exists here.
-- **Idempotency-Key** (`db/idempotency.js`). `POST /api/bookings` replays the stored `{status, body}`
-  for a repeated key; the `idempotency_keys.key` PRIMARY KEY makes two racing writes on one key
-  impossible.
+```bash
+docker compose ps
+docker compose logs -f notifications
+docker compose logs -f payments
+docker compose exec notifications-db psql -U user -d notifications_db -c '\dt'
+docker compose exec payments-db psql -U user -d payments_db -c '\dt'
+curl -i http://localhost:3000/api/internal/orders/8001/payment-status   # 404 at the gateway
+curl -i http://localhost:3000/metrics                                   # 404 at the gateway
+```
 
 ---
 
-## Known monolith pains (deliberately left in — this is the migration target)
+## Security notes
 
-- **One database, shared by all eight contexts.** Cross-context writes are just function calls
-  (Payments writes `orders.payment_status`; the relay writes `services.rating_avg`). Cheap and atomic
-  now; each one becomes a network call + a consistency decision after extraction.
-- **The relay is in-process.** `setInterval(runRelayOnce, 1000)` shares the connection and dies with
-  the process. The broker makes delivery durable across service restarts, but the *publisher* is
-  still the monolith's own timer (a relay container, Debezium/CDC, or a transactional queue would
-  be the next step). The `events` table + `processed_at` claim is the seam that makes that swap
-  mechanical.
-- **Sagas are single-orchestrator.** `sagas` lives in the monolith's SQLite file and the orchestrator
-  is the monolith. That is the right amount of process for one two-step workflow; a second
-  orchestrator instance would need a lease/claim on `sagas` rows (the conditional UPDATEs already
-  make duplicate *messages* safe, but not duplicate pollers).
-- **Shared deploy + blast radius.** A migration, a slow query, or a crash in any context stops all of
-  them. There is no independent scaling: the read-heavy Catalog scales with the write-heavy Booking.
-  (Notifications is now the exception: it has its own deploy and DB, and a notifications outage no
-  longer stops bookings — the relay retries.)
-- **`slot_holds` is a single-DB invariant.** The strongest coupling. It is free in one SQLite file and
-  becomes distributed reservation the moment Booking and Bidding live apart — which is exactly why
-  they are the *last* thing to split.
-- **Auth is no longer process-local.** Area B moved issuance to Keycloak and verification to realm
-  JWKS, so an extracted fleet shares one identity source. The remaining pain is operational: the
-  realm is imported from a committed JSON file, and the demo uses a published hostname
-  (`localhost:8081`) rather than a production ingress with TLS.
+**This stack is a teaching artifact. Do not expose it to the internet.**
 
-Out of scope by design (course adds later): real payment gateways, chat, cart, subscriptions,
-multi-region deployment. `SOAP`/`WSDL` appear nowhere.
+Demo defaults that must change for any real deployment:
+
+| Setting | Demo value | Where |
+|---|---|---|
+| Keycloak admin | `admin` / `admin` | `docker-compose.yml` |
+| RabbitMQ | `edemand` / `edemand-demo-pass` | `docker-compose.yml` |
+| Internal service key | `dev-internal-key-change-me` | `INTERNAL_API_KEY` |
+| Webhook secret | `edemand-webhook-secret` | `WEBHOOK_SECRET` |
+| Seed passwords | `eDemand-2026!` | `lib/db/seed.js`, realm JSON |
+| PostgreSQL | `user` / `password` | compose defaults |
+| Grafana | anonymous admin | intentional for the local demo |
+
+Postgres and the two Express services publish no host ports; RabbitMQ, Keycloak, Jaeger, Prometheus
+and Grafana do, because the demo needs a browser. In production those would sit behind a private
+network and TLS, with per-service workload identity instead of one shared internal key.
+
+The test-only HS256 verifier is disabled whenever `KEYCLOAK_URL` is set. It exists so `node --test`
+can run without an identity provider; it is not a fallback path in the composed stack.
 
 ---
 
-## Tests
+## Design decisions and tradeoffs
 
-`node --test`, no socket — the suite imports the real App Router route handlers and drives them
-in-process against per-file in-memory databases. **78 tests** (76 functional + the 2 Pact contract
-files) across:
+### Why keep the monolith?
 
-`health` · `identity` (auth, 401/403/400/409) · `catalog` (pagination, ownership) · `booking`
-(id 8001, the slot double-book race, idempotency, the full status machine, OTP-gated complete +
-exactly-once credit, cancel/refund, reschedule) · `slots` · `bidding` (accept race, accept-vs-withdraw)
-· `payments-webhook` (replay = single credit) · `reviews-outbox` (stale-then-relay-recomputed,
-relay idempotent, exactly one notification delivered across the boundary) · `admin` (approval writes
-`provider.approved` atomically, the monolith owns no notifications table, relay delivers once) ·
-`area-c-events` (outbox + publisher, duplicate delivery has one effect, `notification.created`
-completes the saga, `booking.status_changed` as a second event, `notification.failed` compensates by
-unapproving the provider, retry succeeds) · `identity-race` (two worker threads race one email through
-a held `BEGIN IMMEDIATE` lock: one 201, one clean 409, one row — the Area D race fix) ·
-`notifications` / `payments` Pact consumer contracts (`test/pact/`, `npm run test:pact` — also a
-separate `contracts` CI job run locally with `act`).
+The brief says to change the monolith only as much as the migration needs. We kept its language, UI
+and public API, removed the moved tables, and replaced the calls with clients. That is the honest
+"strangler" shape: extract a context, leave the rest working, keep the public contract stable.
 
-The Area D retry/timeout/durability behaviour is proven end-to-end on the compose stack by
-`scripts/beat2-failure-recovery.sh`: three real injected failures, and in each one exactly one
-ledger row and one completed order. Unit tests do not fake the payments service for this, because
-the interesting part is the wire.
+### Why these two seams?
 
-The broker itself is not started by `node:test`; `test-helpers/notifications.js` installs an
-in-process publisher that runs the **same** projection rules as the service
-(`notifications-service/notification-rules.cjs`). RabbitMQ, real queues and duplicate redelivery are
-proven by `scripts/verify-area-c.sh` on the compose stack.
+Ranked by how cleanly a context detaches today:
+
+1. **Notifications (first).** One owned table, no synchronous hot-path caller, already
+   projection-shaped. The lowest-risk proof of the service + database + gateway pattern.
+2. **Payments & Wallet (second).** Clearest transaction boundary, highest value from isolation, and
+   the webhook already behaved like a service. The one inward coupling (`orders.payment_status`)
+   became a callback to the order owner.
+3. **Catalog / Provider Profile (next).** Read-heavy and mostly independent, but extraction means
+   Catalog must subscribe to `review.created` for the rating aggregate.
+4. **Booking + Bidding (last / together).** They share the physical `slot_holds` UNIQUE guard. In one
+   database that is free; split them and the availability invariant becomes distributed reservation.
+
+Identity is a shared dependency and is best pulled out early as an IdP — which Area B does with
+Keycloak.
+
+### Rejected alternatives, in one table
+
+| Decision | Rejected alternative | Why |
+|---|---|---|
+| Separate PostgreSQL per service | Shared database, separate schemas | One failure domain and one migration owner; ownership is not physical |
+| nginx gateway | Kong / full API gateway | We need path routing and one published port; Kong is justified by rate limits, consumer credentials and canaries |
+| Orchestrated saga | Choreography | Two steps, one owner, one compensation; choreography hides the flow and blurs compensation ownership |
+| Durable command + reconciler | Best-effort HTTP only | A payment outage would lose the wallet update |
+| Full jitter | Fixed or no jitter | Lockstep retries recreate the outage |
+| Transactional outbox | Publish after commit | A crash between commit and publish loses the event |
+| Keycloak RS256 + JWKS | Shared HS256 secret | A shared secret lets any verifier mint tokens; public-key verification separates checking from creating |
+
+The full defence, including the industrial landscape comparison (Uber, Airbnb, Shopify, Netflix,
+Monzo and others), is in [`docs/dossier.md`](docs/dossier.md).
+
+---
+
+## Known limitations
+
+- **The relay is in-process.** `setInterval` shares the connection and dies with the process. The
+  broker makes delivery durable across service restarts, but the publisher is still the monolith's
+  timer. A relay container, Debezium/CDC or a transactional queue is the next step. The `events` table
+  and `processed_at` claim make that swap mechanical.
+- **The saga orchestrator is single-instance.** `sagas` lives in the monolith's SQLite file. A second
+  orchestrator would need a lease/claim on saga rows. Conditional updates already make duplicate
+  *messages* safe, but not duplicate pollers.
+- **The reconciler is in-process and polls every 3 s.** Recovery is seconds, not milliseconds, and a
+  monolith outage pauses reconciliation.
+- **The internal key is shared.** No mTLS or per-service workload identity.
+- **No token revocation list.** A stolen token works until `exp`.
+- **`slot_holds` is a single-database invariant.** It becomes distributed reservation the moment
+  Booking and Bidding are separated — which is why they are last.
+- **Shared deploy for the monolith.** A migration, slow query or crash in any remaining context stops
+  all of them. Notifications and Payments are now the exception: they have their own deploy and
+  database.
+- **Demo-only operational settings.** Plaintext issuer hostname, demo credentials, anonymous Grafana,
+  no TLS.
+- **Out of scope by design** (course adds later): real payment gateways, chat, cart, subscriptions,
+  multi-region deployment. SOAP/WSDL appear nowhere.
+
+---
+
+## Submission checklist
+
+Repository deliverables:
+
+- [x] Two bounded contexts extracted, each with its own service, database and unchanged public API
+- [x] Notifications and Payments & Wallet both write data (not read-only)
+- [x] Keycloak-only RS256 tokens, verified independently by all three processes
+- [x] Ownership checks and the inherited `GET /api/jobs/{id}` BOLA fixed
+- [x] Outbox → RabbitMQ with publisher confirms and duplicate-delivery dedupe
+- [x] Provider-approval saga with a real compensating action
+- [x] Three injected failures survived with exactly one wallet effect
+- [x] Durable `ledger_commands`, stable `Idempotency-Key`, exponential backoff with full jitter
+- [x] Registration race fixed with a two-thread proof
+- [x] One trace across HTTP and RabbitMQ; Prometheus metrics; Grafana dashboard
+- [x] Pact consumer contracts and CI (`test:unit`, `test:pact`, `build`)
+- [x] `README.md`, `docs/dossier.md`, `docs/demo-runbook.md`, `openapi.yaml`
+- [x] Clean boot with 11 containers running and all verification scripts passing
+- [x] `OWNERS.md` with one owner per area and commit links
+
+Manual deliverables outside the repository:
+
+- [ ] **`capstone-demo.mp4`** — 8–12 minutes, recorded from a clean clone, following
+      [`docs/demo-runbook.md`](docs/demo-runbook.md)
+- [ ] **Peer reviews** — confidential, submitted through the course channel, not committed here
+- [ ] **Owner names and student ids** in [`OWNERS.md`](OWNERS.md) — replace the placeholder identity
+      before the submission form is filled in
+
+---
+
+## Team and ownership
+
+Four members, five areas:
+
+| Member | Areas | Primary evidence |
+|---|---|---|
+| Member 1 | **A + B** | `verify-area-a.ps1` 32/32, `beat3-auth-rejection.sh` 17/17, `beat1` 12/12 |
+| Member 2 | **C** | `verify-area-c.sh` 18/18, `test/area-c-events.test.js` |
+| Member 3 | **D** | `beat2-failure-recovery.sh` 20/20, `test/identity-race.test.js` |
+| Member 4 | **E** | `beat4-find-the-trace.sh` 12/12, `npm run test:pact` 2/2, CI |
+
+The per-area owner, commit link and exact evidence are in [`OWNERS.md`](OWNERS.md).
+
+---
+
+**One-sentence closing:** the migration is done when the public API is unchanged, the moved tables
+are physically gone from the monolith, every service verifies the token itself, invalid tokens get
+401, wrong owners get 403, the inherited job BOLA is closed, every failure leaves exactly one money
+effect, and one trace proves the whole path — the four beats are the reproducible evidence.
