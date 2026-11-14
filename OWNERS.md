@@ -13,14 +13,11 @@ areas were merged.
 
 ## Team roster
 
-> **Before submitting:** fill the two remaining members (C and D) in the roster. The area ownership
-> and commit links below are final.
-
 | Member | Full name | Student ID | Areas owned |
 |---|---|---|---|
 | 1 | **Pannadhorn Chidchue** | `6622780888` | **A + B** |
-| 2 | `__________` | `__________` | **C** |
-| 3 | `__________` | `__________` | **D** |
+| 2 | **Natchanon Meechana** | `6622770871` | **C** |
+| 3 | **Phutharit Promin** | `6622781258` | **D** |
 | 4 | **Thantip Kangwanwanit** | `6622781217` | **E** |
 
 ---
@@ -31,8 +28,8 @@ areas were merged.
 |---|---|---|---|
 | **A — Extract two contexts** | Notifications extracted first (own PostgreSQL DB, Express service, nginx route, monolith no longer owns the table); Payments & Wallet extracted second (own PostgreSQL DB, HTTP client seam, callback to the order owner) | Pannadhorn Chidchue | [`2e266ef`](https://github.com/MelGGEZXD/bangkok-homeservice-fix/commit/2e266ef) (Notifications, with Area B) · [`a4c1b67`](https://github.com/MelGGEZXD/bangkok-homeservice-fix/commit/a4c1b67) (Payments & Wallet) |
 | **B — Security** | Keycloak realm and RS256/JWKS verification in all three processes; forged, expired and wrong-audience tokens rejected with 401; service-side ownership; inherited `GET /api/jobs/{id}` BOLA fixed | Pannadhorn Chidchue | [`2e266ef`](https://github.com/MelGGEZXD/bangkok-homeservice-fix/commit/2e266ef) |
-| **C — Events and saga** | Outbox → RabbitMQ `edemand.events`, durable queues, publisher confirms, duplicate delivery with one effect, provider-approval saga with compensation, orchestration-vs-choreography defence | `Member 2` | [`ce5c257`](https://github.com/MelGGEZXD/bangkok-homeservice-fix/commit/ce5c257) |
-| **D — Failure and idempotency** | Three fault switches (lost reply, slow reply, timed outage) survived with one wallet effect; durable `ledger_commands` and reconciler; timeout + exponential backoff with full jitter; stable `Idempotency-Key`; customer/provider registration race fixed with a two-worker-thread proof | `Member 3` | [`97505b6`](https://github.com/MelGGEZXD/bangkok-homeservice-fix/commit/97505b6) |
+| **C — Events and saga** | Outbox → RabbitMQ `edemand.events`, durable queues, publisher confirms, duplicate delivery with one effect, provider-approval saga with compensation, orchestration-vs-choreography defence | Natchanon Meechana | [`ce5c257`](https://github.com/MelGGEZXD/bangkok-homeservice-fix/commit/ce5c257) |
+| **D — Failure and idempotency** | Three fault switches (lost reply, slow reply, timed outage) survived with one wallet effect; durable `ledger_commands` and reconciler; timeout + exponential backoff with full jitter; stable `Idempotency-Key`; customer/provider registration race fixed with a two-worker-thread proof | Phutharit Promin | [`97505b6`](https://github.com/MelGGEZXD/bangkok-homeservice-fix/commit/97505b6) |
 | **E — Observability and contracts** | One OpenTelemetry trace across HTTP and RabbitMQ; Prometheus metrics and Grafana dashboard (request rate, error rate, p95 per service); Pact consumer contracts for both new boundaries; GitHub Actions CI run locally with `act` | Thantip Kangwanwanit | [`97505b6`](https://github.com/MelGGEZXD/bangkok-homeservice-fix/commit/97505b6) |
 
 ---
